@@ -1,0 +1,1356 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This script contains univariate analyses at the network level + amygdala and hippocampus, and behavioral analyses, for the reframe-detail project. 
+
+
+# Setup 
+```{r}
+# Libraries
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(ez)
+library(ggsegSchaefer)
+library(ggseg3d)
+library(ggseg)
+library(sjPlot)
+library(kableExtra)
+library(corrplot)
+library(ggpubr)
+library(here)
+library(glue)
+library(officer)
+library(rvg)
+library(emmeans)
+
+
+# Calculations 
+zscore <- function(x) (x-mean(x))/sd(x)
+se <- function(x) sqrt(var(x)/length(x))  #function to calculate SE
+ci <- function(x) (sqrt(var(x)/length(x))) * 1.96  #function to calculate 95% CI
+
+
+#Plotting theme 
+fontsize <- 14
+linesize <- .5
+barcolors <- c("#f76c67","#67aaf7","#0bca81","#f6a84f","#9c67f7","#67f7f0","#7F7F7F")
+
+my_theme <- function() {
+    theme(plot.title = element_text(hjust = 0.5, size=fontsize, margin=margin(0,0,20,0)),
+        axis.line.x = element_line(color = "black", size = 1), 
+        axis.line.y = element_line(color = "black", size = 1),
+        axis.text.x = element_text(size = .8*fontsize, hjust=1, vjust=1, angle = 45),
+        axis.text.y = element_text(size = .8*fontsize), 
+        axis.title.y = element_text(size = 1*fontsize),
+        axis.title.x = element_blank(), 
+        panel.background = element_blank(),
+        legend.position="none", 
+        strip.text.x = element_text(size=fontsize), 
+        text = element_text(family="Helvetica")) # +
+  # theme(plot.margin = margin(1, 1, 1, 1, "cm"))
+}
+```
+
+## Load data 
+
+### behavioral data
+```{r}
+behav <- read.csv('/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/behav_data_allonsets.csv')
+
+behav <- behav %>%
+  filter(period=="recall") # keep only one row per trial
+
+nina_behav <- read.csv('/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/onsets_all.csv')
+nina_behav <- nina_behav %>%
+  filter(period=="recall")
+
+behav$eventDet = nina_behav$eventDetails.y # adding nina's add'l coding 
+behav$visualDet = nina_behav$visualDetails.y
+
+
+# add in missing data from nina's coding 
+missing = read.csv('/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/missing_coded.csv')
+behav <- behav %>%
+  left_join(missing, by = c("subID", "videoName"))
+behav$eventDets = ifelse(is.na(behav$eventDet.x), behav$eventDet.y, behav$eventDet.x)
+behav$visualDets = ifelse(is.na(behav$visualDet.x), behav$visualDet.y, behav$visualDet.x)
+
+# remove unnecessary columns 
+behav = behav %>% select(-eventDet.x, -visualDet.x, -eventDet.y, -visualDet.y)
+
+
+table(behav$subID,behav$run)
+nsub.behav <- length(unique(behav$subID))
+
+# Some video info is contained only for the first round. Make sure it's repeated for other rounds. 
+behav.roundone <- behav %>% 
+  filter(regRound==1) %>%
+  select("subID","videoName","recallValence","recallArousal","recallVividness",
+         "encValence","encArousal","valenceChange","arousalChange","successful",
+         "remembered","correctDetails", "eventDets", "visualDets")
+behav.left <- behav[,1:18]
+
+behav.all <- full_join(behav.left,behav.roundone,by=c("subID","videoName"),
+                       suffix=c("",".ignore"))
+
+
+# no event/visual detail column should have "NA" - replace with zero. 
+
+behav.all$eventDets = ifelse(is.na(behav.all$eventDets), 0, behav.all$eventDets)
+behav.all$visualDets = ifelse(is.na(behav.all$visualDets), 0, behav.all$visualDets)
+```
+
+### activity data 
+
+```{r}
+subjects <- list.files(path='/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/redo/',full.names=TRUE, recursive = TRUE, pattern = 'block15s_timepoint-averages_schaefer')
+actdata  = do.call(rbind, lapply(subjects, function(x) {read.csv(x, header = TRUE)}))
+
+
+tmp <- filter(actdata,ROI=="LH_HIPP")
+table(tmp$subID,tmp$run)
+nsub.act <- length(unique(actdata$subID))
+```
+
+### combine behavioral + activity 
+```{r}
+# first fix subID numbers to follow same format
+behav.all <- behav.all %>%
+  mutate(subID.orig = subID,
+         subID = paste0("sub-",subID.orig))
+
+alldata <- left_join(actdata,behav.all,by=c("subID","videoName","trial"),suffix=c(".act",".beh"))
+```
+
+summarize trial numbers per condition: 
+```{r}
+tmp <- filter(alldata,ROI=="LH_HIPP" & subID=="sub-s002")
+table(tmp$conditionName,tmp$valenceCategory)
+```
+
+### cleaning 
+
+#### Define factors 
+```{r}
+alldata$ROI <- as.factor(alldata$ROI)
+alldata$conditionName <- as.factor(alldata$conditionName)
+alldata$valenceCategory <- as.factor(alldata$valenceCategory)
+alldata$subID <- as.factor(alldata$subID)
+alldata$regRound.categ <- as.factor(alldata$regRound) # keep both integer & categorical versions
+alldata$videoName <- as.factor(alldata$videoName)
+alldata$periodLabel <- as.factor(alldata$periodLabel)
+```
+
+#### Remove outliers
+
+Defined as values abs(z)>4, calculated within subject and ROI - as in Cooper & Ritchey 2020 parcel analysis
+
+Note that these time-points come from the residuals of a nuisance regressor-only model, which included run regressors that account for mean differences between runs.
+
+```{r}
+### add z score of activity estimates within region and subject and time-period
+alldata <- alldata %>%
+  group_by(subID, ROI, periodLabel) %>%
+  mutate(Z = zscore(regulationActivity)) %>%
+  ungroup()
+
+# remove betas that are > 4SD 
+tmp <- alldata %>%
+  mutate(isOutlier = ifelse(abs(Z)>4,TRUE,FALSE))
+
+# Following Cooper & Ritchey, remove trials where mean for ANY ROI is an outlier
+outliers <- tmp %>%
+  select(isOutlier,subID,trial) %>%
+  filter(isOutlier) %>%
+  unique()
+alldata <- left_join(alldata,outliers,by=c("subID","trial"))
+alldata$isOutlier[is.na(alldata$isOutlier)] <- FALSE
+
+# Summarize number of outliers
+table(alldata$subID,alldata$isOutlier)
+table(alldata$isOutlier)
+
+alldata$regulationActivity[alldata$isOutlier] <- NA  #mark value as NA if outlier
+```
+
+#### Trial filters 
+Removing reappraisal trials that were initially collected for a separate study; 
+filtering trials to remembered-only 
+```{r}
+alldata <- alldata %>%
+  mutate(isComplete.emo = ifelse(is.na(valenceChange) | is.na(arousalChange),
+                             FALSE,TRUE))
+
+# Removing negative reappraisal (non-memory) trials
+alldata <- alldata %>%
+  filter(conditionName == "remember")
+
+
+all_nr = alldata # capturing all trials, not just remembered 
+
+alldata <- alldata %>% filter(remembered == 1) # only looking at remembered-only data! 
+```
+
+
+#### Mean centering predictors 
+Within-participant 
+```{r}
+alldata <- alldata %>%
+  group_by(subID,ROI,periodLabel) %>% 
+  mutate(regSuccess = scale(regSuccess,scale=FALSE),
+         valenceChange = scale(valenceChange,scale=FALSE),
+         arousalChange = scale(arousalChange,scale=FALSE),
+         recallVividness = scale(recallVividness,scale=FALSE),
+         eventDets = scale(eventDets, scale =FALSE), 
+         visualDets = scale(visualDets, scale=FALSE),
+         correctDetails = scale(correctDetails, scale=FALSE)) %>% # mean-center within subject
+  ungroup()
+
+# double check that this worked as expected
+tmp <- alldata %>% filter(valenceCategory=="neg" & ROI=="LH_HIPP") %>% group_by(subID) %>% summarize(meansucc = mean(regSuccess,na.rm=TRUE))
+```
+
+
+#### Getting ROI info 
+```{r}
+alldata %>%
+  ungroup() %>%
+  filter(subID=="sub-s005" & trialID==8) %>%
+  mutate(ROIsplit = ROI)  %>%
+  separate(ROIsplit, into = c("hemisphere", "network", "netregion"), sep = "_", extra = "merge") %>%
+  select(ROI,hemisphere,network,netregion) -> roi_info
+
+alldata <- left_join(alldata,roi_info,by=c("ROI"))
+tempdf = alldata %>%
+  filter(subID=="sub-s005" & ROI=="DefaultC")
+```
+
+
+save alldata for use in other analyses - specify a path accordingly 
+```{r}
+saveRDS(alldata, "alldata_reframe-detail.rds")
+saveRDS(mem.data, "mem.data_reframe-detail.rds")
+```
+
+
+
+# Analysis: DMN subnetwork activity 
+
+## setup 
+```{r}
+rois <- levels(alldata$ROI)
+outDir <- '/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/reframe-detail_timepoint_results/'
+alphafdr <- .05
+```
+
+get network-level data:
+```{r}
+include_networks = c("DefaultA","DefaultB","DefaultC", "HIPP", "AMYG")
+
+# Summarize data
+alldata %>%
+  # filter to include only some rows
+  filter(network %in% include_networks) %>%
+  # average over ROIs within a network
+  group_by(subID,trial, cueWord.act, network, eventDets, visualDets, correctDetails, valenceCategory) %>% 
+  summarize(regulationActivity = mean(regulationActivity,na.rm=TRUE)) %>%
+  ungroup() -> network.data
+```
+
+create function for running model:
+```{r}
+model.stats <- data.frame()
+
+
+# define function
+detail_emo_neuref <- function(curROI,model.stats) {
+  
+  # model
+  roiData <- network.data %>% filter(network %in% curROI)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model <- lmer(regulationActivity ~ visualDets + eventDets + 
+                       visualDets*valenceCategory +eventDets*valenceCategory + (1|subID), data = roiData)
+  
+  print(tab_model(full.model,title="detail x emotion, neutral reference"))
+                
+  
+  stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats,ROI=curROI)
+  model.stats <- rbind(model.stats,stats)
+  
+  p <- plot_model(full.model, show.values = TRUE, show.p = FALSE,
+           value.offset = .3, vline.color = "gray30",
+           colors=c("lightskyblue","steelblue"), type = "std") + ylim(c(-.3,.3)) +
+    ggtitle(curROI) +
+  my_theme()
+  print(p)
+  
+  return(model.stats)
+}
+```
+
+## run models
+```{r}
+model.stats <- detail_emo_neuref("DefaultA",model.stats)
+model.stats <- detail_emo_neuref("DefaultB",model.stats)
+model.stats <- detail_emo_neuref("DefaultC",model.stats)
+model.stats <- detail_emo_neuref("HIPP",model.stats)
+model.stats <- detail_emo_neuref("AMYG",model.stats)
+```
+
+
+## Figure 2c (network activity by valence)
+```{r}
+include_rois <- c("DefaultA","DefaultB","DefaultC")
+
+# Summarize data
+alldata %>%
+  filter(network %in% include_rois) %>%
+  mutate(network = factor(network,levels=include_rois)) %>%
+  group_by(subID,ROI,network,periodLabel,valenceCategory) %>% # average across trials
+  summarize(meanActivity = mean(regulationActivity,na.rm=TRUE)) %>%
+  group_by(subID,network,periodLabel,valenceCategory) %>% # average across ROIs 
+  summarize(meanNet = mean(meanActivity)) -> subdata
+
+subdata %>%
+  filter(valenceCategory=="neu") %>%
+  mutate(meanNeutral = meanNet) %>%
+  select(subID,network,periodLabel,meanNeutral) -> subdata.neu
+
+subdata %>%
+  left_join(subdata.neu,by=c("subID","network","periodLabel")) %>%
+  mutate(valenceDiff = meanNet - meanNeutral) -> subdata
+
+subdata %>%
+  group_by(network,periodLabel,valenceCategory) %>% # then average across subjects
+  summarize(meanAct = mean(meanNet),
+            seAct = se(meanNet)) -> meandata
+
+network_names <- list(
+  'DMN-A'="Core midline",
+  'DMN-B'="Dorsomedial",
+  'DMN-C'="Medial temporal"
+)
+
+network_labeller <- function(variable,value){
+  return(network_names[value])
+}
+
+subdata %>%
+  ggplot(aes(y=meanNet,x=valenceCategory,color=valenceCategory,fill=valenceCategory)) + 
+  facet_grid(.~network,   labeller = network_labeller) +
+  # add individual data points
+  geom_jitter(width = 0.15, size = 0.5, alpha = 0.75) +
+  # add a boxplot
+  geom_boxplot(width = .5, #0.25, 
+               fill = "white", 
+               alpha = 0.75, 
+               #fatten = 0, # removes the median line
+               outlier.alpha = 0) + 
+  # add a point that represents the mean
+  #stat_summary(fun = mean, 
+  #             geom = "point", 
+  #             size = 2) + 
+  ggtitle("Network activity by valence") + 
+   ylab("Network activity") + # for the y axis label  
+   xlab("Valence") +
+  # Set fill colors for the bars and specify legend labels
+  scale_fill_manual(values = c("neg" = "#e3401a",  # Red for negative
+                               "neu" = "#1f78b4",   # Blue for neutral
+                               "pos" = "#33a02c"),  # Green for positive
+                    labels = c("neg" = "negative", "neu" = "neutral", "pos" = "positive"),
+                    name = "Valence") + 
+  scale_color_manual(values = c("neg" = "#e3401a",  # Red for negative
+                               "neu" = "#1f78b4",   # Blue for neutral
+                               "pos" = "#33a02c"),  # Green for positive
+                    labels = c("neg" = "negative", "neu" = "neutral", "pos" = "positive"),
+                    name = "Valence") + 
+  my_theme() + theme(
+    axis.title.y = element_text(size = 10),
+      axis.title.x = element_text(size = 10), 
+      axis.text.y = element_text(size = 8), 
+      axis.text.x = element_text(size = 8),
+   # strip.text.x = element_text(size = 8),
+    axis.line.x = element_line(color = "black", size = .5), 
+    axis.line.y = element_line(color = "black", size = .5), 
+    axis.ticks = element_line(color = "black", size = .5),
+    axis.ticks.length = unit(0.1, "cm"),
+    plot.title = element_blank(),
+    panel.background = element_blank(),
+    strip.text.x = element_blank()
+
+    
+  ) -> p2
+
+p2
+
+ ggsave(filename = '/Users/ninacurko/Desktop/may25-reframe-figs/network_valence.png',
+       plot = p2,
+       device = "png",
+       dpi = 300,
+       width = 4.2,
+       height = 2.7 ,
+       units = "in")
+
+```
+
+## results 
+
+### narrative details
+```{r}
+# event.model
+event.model = model.stats %>% filter((row.names(model.stats) == "eventDets")|(row.names(model.stats) == "eventDets1")|(row.names(model.stats) == "eventDets2")|(row.names(model.stats) == "eventDets3")|(row.names(model.stats) == "eventDets4"))
+
+p.values <- event.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.model <- cbind(event.model,Pr.fdr)
+event.model <- mutate(event.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### perceptual details 
+```{r}
+# visual.model
+visual.model = model.stats %>% filter((row.names(model.stats) == "visualDets")|(row.names(model.stats) == "visualDets1")|(row.names(model.stats) == "visualDets2")|(row.names(model.stats) == "visualDets3")|(row.names(model.stats) == "visualDets4"))
+
+p.values <- visual.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.model <- cbind(visual.model,Pr.fdr)
+visual.model <- mutate(visual.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### positive valence 
+```{r}
+# pos.model
+pos.model = model.stats %>% filter((row.names(model.stats) == "valenceCategorypos")|(row.names(model.stats) == "valenceCategorypos1")|(row.names(model.stats) == "valenceCategorypos2")|(row.names(model.stats) == "valenceCategorypos3")|(row.names(model.stats) == "valenceCategorypos4"))
+p.values <- pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+pos.model <- cbind(pos.model,Pr.fdr)
+pos.model <- mutate(pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(pos.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### negative valence 
+```{r}
+# neg.model
+neg.model = model.stats %>% filter((row.names(model.stats) == "valenceCategoryneg")|(row.names(model.stats) == "valenceCategoryneg1")|(row.names(model.stats) == "valenceCategoryneg2")|(row.names(model.stats) == "valenceCategoryneg3")|(row.names(model.stats) == "valenceCategoryneg4"))
+p.values <- neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+neg.model <- cbind(neg.model,Pr.fdr)
+neg.model <- mutate(neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### perceptual x positive 
+```{r}
+visual.pos.model = model.stats %>% filter((row.names(model.stats) == "visualDets:valenceCategorypos")|(row.names(model.stats) == "visualDets:valenceCategorypos1")|(row.names(model.stats) == "visualDets:valenceCategorypos2")|(row.names(model.stats) == "visualDets:valenceCategorypos3")|(row.names(model.stats) == "visualDets:valenceCategorypos4"))
+
+p.values <- visual.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.pos.model <- cbind(visual.pos.model,Pr.fdr)
+visual.pos.model <- mutate(visual.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.pos.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### perceptual x negative 
+```{r}
+# visual.neg.model
+visual.neg.model = model.stats %>% filter((row.names(model.stats) == "visualDets:valenceCategoryneg")|(row.names(model.stats) == "visualDets:valenceCategoryneg1")|(row.names(model.stats) == "visualDets:valenceCategoryneg2")|(row.names(model.stats) == "visualDets:valenceCategoryneg3")|(row.names(model.stats) == "visualDets:valenceCategoryneg4"))
+
+p.values <- visual.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.neg.model <- cbind(visual.neg.model,Pr.fdr)
+visual.neg.model <- mutate(visual.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### narrative.x positive 
+
+```{r}
+event.pos.model = model.stats %>% filter((row.names(model.stats) == "eventDets:valenceCategorypos")|(row.names(model.stats) == "eventDets:valenceCategorypos1")|(row.names(model.stats) == "eventDets:valenceCategorypos2")|(row.names(model.stats) == "eventDets:valenceCategorypos3")|(row.names(model.stats) == "eventDets:valenceCategorypos4"))
+
+p.values <- event.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.pos.model <- cbind(event.pos.model,Pr.fdr)
+event.pos.model <- mutate(event.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.pos.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+### narrative x negative 
+
+```{r}
+# event.neg.model
+event.neg.model = model.stats %>% filter((row.names(model.stats) == "eventDets:valenceCategoryneg")|(row.names(model.stats) == "eventDets:valenceCategoryneg1")|(row.names(model.stats) == "eventDets:valenceCategoryneg2")|(row.names(model.stats) == "eventDets:valenceCategoryneg3")|(row.names(model.stats) == "eventDets:valenceCategoryneg4"))
+
+p.values <- event.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neg.model <- cbind(event.neg.model,Pr.fdr)
+event.neg.model <- mutate(event.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+
+# Figure 2d (perceptual x medial temporal)
+
+```{r}
+include_rois <- c("DefaultC")
+roiData <- network.data %>% filter(network %in% include_rois)
+roiData$valenceCategory <- factor(roiData$valenceCategory,
+                                  levels = c("neu", "neg", "pos"))
+
+# model for DMN-C 
+full.model.c <- lmer(regulationActivity ~ visualDets + eventDets +
+                       visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+
+# plotting function
+plot_visualDets_noScatter <- function(cur_model, roiData, ylab) {
+
+  visualDets_seq <- seq(-8, 12, length.out = 100)
+  pred_data <- data.frame(
+    visualDets = visualDets_seq,
+    eventDets = mean(roiData$eventDets),
+    valenceCategory = "neu"
+  )
+
+  pred_values <- predict(cur_model, newdata = pred_data, re.form = NA, se.fit = TRUE)
+
+  pred_data <- pred_data %>%
+    mutate(
+      pred  = pred_values$fit,
+      se    = pred_values$se.fit,
+      lower = pred - 1.96 * se,
+      upper = pred + 1.96 * se
+    )
+
+  p1 <- ggplot() +
+    geom_point(data = roiData, aes(x = visualDets, y = regulationActivity), alpha = 0) +
+    geom_line(data = pred_data, aes(x = visualDets, y = pred), color = "violet", size = 1) +
+    geom_ribbon(data = pred_data, aes(x = visualDets, ymin = lower, ymax = upper),
+                fill = "violet", alpha = 0.2) +
+    labs(x = "Perceptual details recalled (mean-centered)", y = ylab) +
+    theme_minimal(14) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.background = element_blank(),
+      axis.line.x = element_line(color = "black", size = .5),
+      axis.line.y = element_line(color = "black", size = .5),
+      axis.title.y = element_text(size = 10),
+      axis.title.x = element_text(size = 10),
+      axis.text.y = element_text(size = 8),
+      axis.text.x = element_text(size = 8),
+      plot.title = element_blank(),
+      axis.ticks = element_line(color = "black", size = .5),
+      axis.ticks.length = unit(0.1, "cm")
+    ) +
+    scale_x_continuous(limits = c(-8, 12), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(-.2, .4))
+
+  ggMarginal(p1, type = "histogram", fill = "gray30", size = 10, margins = "x")
+}
+
+
+dw <- plot_visualDets_noScatter(full.model.c, roiData, "MT subnetwork activity")
+dw
+
+# UNCOMMENT + INSERT PATH TO EXPORT 
+# ggsave(filename = 'insert-path',
+#        plot = dw,
+#        device = "png",
+#        dpi = 300,
+#        width = 3.5,
+#        height = 2.25,
+#        units = "in")
+```
+
+
+# Figure 3b (perceptual x amygdala)
+
+```{r}
+plot_visualDets_noHist <- function(cur_model,roiData,ylab) {
+  
+  visualDets_seq <- seq(-8, 12, length.out = 100)
+  pred_data <- data.frame(
+    visualDets = visualDets_seq,
+    eventDets = mean(roiData$eventDets),  # Holding eventDets constant at its mean
+    valenceCategory = "neu"  # You can specify any level of valenceCategory here
+  )
+  
+  # Get predictions and standard errors using the model
+  pred_values <- predict(cur_model, newdata = pred_data, re.form = NA, se.fit = TRUE)
+  
+  # Combine predictions and standard errors into a data frame
+  pred_data <- pred_data %>%
+    mutate(
+      pred = pred_values$fit,
+      se = pred_values$se.fit,
+      lower = pred - 1.96 * se,  # Lower bound of 95% CI
+      upper = pred + 1.96 * se   # Upper bound of 95% CI
+    )
+  
+  # Plot using ggplot2
+  p1 <- ggplot() +
+    # Individual data points
+    geom_point(data=roiData, aes(x=visualDets,y=regulationActivity), alpha=0) +
+    # Individual lines
+    # geom_line(data=roiData, aes(x=visualDets,y=regulationActivity,group=subID),
+    #           stat="smooth",method = "lm", color="slateblue",size=1, alpha = 0.5) +
+    # Line and ribbon for visualDets
+    geom_line(data = pred_data, aes(x = visualDets, y = pred), color = "violet", size = 1) +  
+    geom_ribbon(data = pred_data, aes(x = visualDets, ymin = lower, ymax = upper), fill = "violet", alpha = 0.2) +  
+    labs(x = "Perceptual details recalled (mean-centered)", y = ylab) +
+    theme_minimal(14) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.background = element_blank(),
+      axis.line.x = element_line(color = "black", size = .5), 
+      axis.line.y = element_line(color = "black", size = .5), 
+      axis.title.y = element_text(size = 10),
+      axis.title.x = element_text(size = 10), 
+      axis.text.y = element_text(size = 8), 
+      axis.text.x = element_text(size = 8),
+      plot.title = element_blank(),
+      axis.ticks = element_line(color = "black", size = .5),
+      axis.ticks.length = unit(0.1, "cm")
+    ) +
+  scale_x_continuous(limits = c(-8, 12), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(-.2, .4))
+  
+
+  p1 
+  
+  return(p1)
+}
+
+
+include_rois <- c("AMYG")
+   roiData <- network.data %>% filter(network %in% include_rois)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model <- lmer(regulationActivity ~ visualDets + eventDets +
+                         visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  full.model.amy <- full.model
+
+amyg <- plot_visualDets_noHist(full.model, roiData, "Amygdala activity")
+amyg 
+
+# UNCOMMENT + INSERT PATH TO EXPORT 
+# ggsave(filename = 'insert-path',
+#        plot = amyg,
+#        device = "png",
+#        dpi = 300,
+#        width = 3.5,
+#        height = 2.25,
+#        units = "in")
+```
+
+
+# Figure 2a + 3a (model plotting)
+
+set up models for plotting 
+
+
+```{r}
+ include_rois <- c("HIPP")
+   roiData <- network.data %>% filter(network %in% include_rois)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model <- lmer(regulationActivity ~ visualDets + eventDets +
+                         visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  full.model.hipp <- full.model
+  
+  include_rois <- c("DefaultB")
+  roiData <- network.data %>% filter(network %in% include_rois)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model.b <- lmer(regulationActivity ~ visualDets + eventDets +
+                         visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  
+  include_rois <- c("DefaultA")
+  roiData <- network.data %>% filter(network %in% include_rois)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model.a <- lmer(regulationActivity ~ visualDets + eventDets +
+                         visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  
+  # full.model.c for Default C already made above 
+  # full.model.amy for Amygdala already made above 
+```
+
+
+plot:
+```{r}
+p1 <- plot_models(full.model.a, full.model.b, full.model.c,
+           # value.offset = .3, order.terms=c(1,4,2,3,5,6,7,8),
+           vline.color = "gray30", colors=c("slateblue4","lightsteelblue","slateblue1"),
+           #c("hotpink","lightpink","lightsalmon"), 
+           std.est = "std",
+           m.labels = c("Core", "DM", "MTL"),
+           show.values = FALSE, show.p = FALSE, p.shape = TRUE, p.threshold=.029,
+           spacing=.7,
+           axis.labels = rev(c('Perceptual Details', 'Narrative Details', 'Neg Valence','Pos Valence',
+                           'Perceptual x Neg','Perceptual x Pos',
+                           'Narrative x Neg','Narrative x Pos'))) +
+  guides(shape=FALSE) +
+  ylim(c(-.3,.3)) +
+  theme_minimal(12) + theme(legend.title = element_blank())
+  print(p1)
+  
+  p2 <- plot_models(full.model.amy, full.model.hipp,
+           # value.offset = .3, order.terms=c(1,4,2,3,5,6,7,8),
+           vline.color = "gray30", colors=c("hotpink","orange"), 
+           std.est = TRUE,
+           m.labels = c("Amyg","Hipp"),
+           show.values = FALSE, show.p = FALSE, p.shape = TRUE, p.threshold=.01,
+           spacing=.7,
+           axis.labels = rev(c('Perceptual Details', 'Narrative Details', 'Neg Valence','Pos Valence',
+                           'Perceptual x Neg','Perceptual x Pos',
+                           'Narrative x Neg','Narrative x Pos'))) +
+  guides(shape=FALSE) +          
+  ylim(c(-.3,.3)) +
+  theme_minimal(14) + theme(legend.title = element_blank())
+  print(p2)
+  
+  ggarrange(p1,p2,ncol=2,legend="top")
+  
+  # UNCOMMENT + ADD PATH below for export 
+  
+  # ggsave(filename = 'insert-path',
+  #      plot = p1,
+  #      device = "png",
+  #      dpi = 300,
+  #      width = 4,
+  #      height = 4,
+  #      units = "in")
+  # 
+  # 
+  # 
+  # ggsave(filename = 'insert-path',
+  #      plot = p2,
+  #      device = "png",
+  #      dpi = 300,
+  #      width = 4,
+  #      height = 4,
+  #      units = "in")
+  
+```
+
+
+# Analysis: change reference category 
+
+```{r}
+model.stats <- data.frame()
+
+
+detail_emo_neuref <- function(curROI,model.stats) {
+  
+  # model
+  roiData <- network.data %>% filter(network %in% curROI)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("pos", "neu", "neg"))
+  full.model <- lmer(regulationActivity ~ visualDets*valenceCategory+eventDets*valenceCategory+ (1|subID), data = roiData)
+  print(tab_model(full.model,title="uni detail x emotion, ALT reference"))
+                  #,
+           # file=paste0("outfiles/network_",curROI,"_rem-only.html")))
+  
+  # p1 <- plot_model(full.model, type = "pred", 
+  #                  terms = c("regSuccess [-2.5:2.5]","conditionName")) + 
+  #   theme_minimal(10) + guides(color="none")
+  
+    stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats,ROI=curROI)
+  model.stats <- rbind(model.stats,stats)
+  
+  return(model.stats)
+}
+
+model.stats <- detail_emo_neuref("DefaultA",model.stats)
+model.stats <- detail_emo_neuref("DefaultB",model.stats)
+model.stats <- detail_emo_neuref("DefaultC",model.stats)
+model.stats <- detail_emo_neuref("HIPP",model.stats)
+model.stats <- detail_emo_neuref("AMYG",model.stats)
+
+
+
+# event.model
+event.model = model.stats %>% filter((row.names(model.stats) == "eventDets")|(row.names(model.stats) == "eventDets1")|(row.names(model.stats) == "eventDets2")|(row.names(model.stats) == "eventDets3")|(row.names(model.stats) == "eventDets4"))
+
+p.values <- event.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.model <- cbind(event.model,Pr.fdr)
+event.model <- mutate(event.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# visual.model
+visual.model = model.stats %>% filter((row.names(model.stats) == "visualDets")|(row.names(model.stats) == "visualDets1")|(row.names(model.stats) == "visualDets2")|(row.names(model.stats) == "visualDets3")|(row.names(model.stats) == "visualDets4"))
+
+p.values <- visual.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.model <- cbind(visual.model,Pr.fdr)
+visual.model <- mutate(visual.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# neg.model
+neg.model = model.stats %>% filter((row.names(model.stats) == "valenceCategoryneg")|(row.names(model.stats) == "valenceCategoryneg1")|(row.names(model.stats) == "valenceCategoryneg2")|(row.names(model.stats) == "valenceCategoryneg3")|(row.names(model.stats) == "valenceCategoryneg4"))
+p.values <- neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+neg.model <- cbind(neg.model,Pr.fdr)
+neg.model <- mutate(neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+
+# neu.model
+neu.model = model.stats %>% filter((row.names(model.stats) == "valenceCategoryneu")|(row.names(model.stats) == "valenceCategoryneu1")|(row.names(model.stats) == "valenceCategoryneu2")|(row.names(model.stats) == "valenceCategoryneu3")|(row.names(model.stats) == "valenceCategoryneu4"))
+p.values <- neu.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+neu.model <- cbind(neu.model,Pr.fdr)
+neu.model <- mutate(neu.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(neu.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+
+# visual.neg.model
+visual.neg.model = model.stats %>% filter((row.names(model.stats) == "visualDets:valenceCategoryneg")|(row.names(model.stats) == "visualDets:valenceCategoryneg1")|(row.names(model.stats) == "visualDets:valenceCategoryneg2")|(row.names(model.stats) == "visualDets:valenceCategoryneg3")|(row.names(model.stats) == "visualDets:valenceCategoryneg4"))
+
+p.values <- visual.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.neg.model <- cbind(visual.neg.model,Pr.fdr)
+visual.neg.model <- mutate(visual.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# visual.neu.model
+visual.neu.model = model.stats %>% filter((row.names(model.stats) == "visualDets:valenceCategoryneu")|(row.names(model.stats) == "visualDets:valenceCategoryneu1")|(row.names(model.stats) == "visualDets:valenceCategoryneu2")|(row.names(model.stats) == "visualDets:valenceCategoryneu3")|(row.names(model.stats) == "visualDets:valenceCategoryneu4"))
+
+p.values <- visual.neu.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.neu.model <- cbind(visual.neu.model,Pr.fdr)
+visual.neu.model <- mutate(visual.neu.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.neu.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# event.neg.model
+event.neg.model = model.stats %>% filter((row.names(model.stats) == "valenceCategoryneg:eventDets")|(row.names(model.stats) == "valenceCategoryneg:eventDets1")|(row.names(model.stats) == "valenceCategoryneg:eventDets2")|(row.names(model.stats) == "valenceCategoryneg:eventDets3")|(row.names(model.stats) == "valenceCategoryneg:eventDets4"))
+
+p.values <- event.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neg.model <- cbind(event.neg.model,Pr.fdr)
+event.neg.model <- mutate(event.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# event.neu.model
+event.neu.model = model.stats %>% filter((row.names(model.stats) == "valenceCategoryneu:eventDets")|(row.names(model.stats) == "valenceCategoryneu:eventDets1")|(row.names(model.stats) == "valenceCategoryneu:eventDets2")|(row.names(model.stats) == "valenceCategoryneu:eventDets3")|(row.names(model.stats) == "valenceCategoryneu:eventDets4"))
+
+p.values <- event.neu.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neu.model <- cbind(event.neu.model,Pr.fdr)
+event..model <- mutate(event.neu.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.neu.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+# Analysis: behavioral 
+
+## setup 
+```{r}
+allsubs <- unique(actdata$subID)
+
+behav.all %>% 
+  filter(subID %in% allsubs) %>%
+  filter(conditionName=="remember") %>%
+  filter(remembered==1) -> mem.data
+```
+
+## analysis 
+
+
+```{r}
+means_all = mem.data %>%
+  group_by(valenceCategory) %>%
+  summarise(
+    mean_event = mean(eventDets),
+    mean_visual = mean(visualDets),
+    mean_total = mean(correctDetails)
+  )
+
+means_all
+
+
+
+sd_all = mem.data %>% # for reporting SDs in paper 
+  group_by(valenceCategory) %>%
+  summarise(
+    sd_event = sd(eventDets),
+    sd_visual = sd(visualDets),
+    sd_total = sd(correctDetails)
+  )
+
+
+sd_all
+
+
+# setting up for behavioral plot: 
+
+
+means_individ = mem.data %>%
+  group_by(valenceCategory, subID) %>%
+  summarise(
+    mean_event = mean(eventDets),
+    mean_visual = mean(visualDets),
+    mean_total = mean(correctDetails)
+  )
+
+# pivot means_individ to long format 
+means_individ_long <- means_individ %>%
+  pivot_longer(cols = c(mean_event, mean_visual),
+               names_to = "condition",
+               values_to = "mean") %>%
+  mutate(detail = ifelse(condition == "mean_event", "event", "visual"))
+
+
+# computing se from subject-level means 
+se_individ_long <- means_individ_long %>%
+  group_by(valenceCategory, detail) %>%
+  summarise(se = sd(mean) / sqrt(n()), .groups = "drop")
+
+
+means_all_long = means_all %>%
+  pivot_longer(cols = mean_event:mean_total,
+               names_to = "detail",
+               values_to = "mean") %>%
+  mutate(detail = gsub("mean_", "", detail))
+
+
+behav_plot_data = merge(means_all_long, se_individ_long, by = c("valenceCategory", "detail"))
+behav_plot_nocorrectdets = behav_plot_data %>% filter(detail != "total")
+```
+
+correct details
+```{r}
+mem_Correct <-ezANOVA(data = mem.data,
+                       dv = .(correctDetails),
+                       wid = .(subID),
+                       within = .(valenceCategory),
+                       type = 3,
+                       detailed = TRUE)
+mem_Correct
+
+aov_model <- aov(correctDetails ~ valenceCategory + Error(subID/valenceCategory), data = mem.data)
+emmeans_result <- emmeans(aov_model, ~ valenceCategory)
+pairs(emmeans_result, adjust = "tukey")
+
+```
+
+
+narrative details 
+```{r}
+mem_Event <-ezANOVA(data = mem.data,
+                       dv = .(eventDets),
+                       wid = .(subID),
+                       within = .(valenceCategory),
+                       type = 3,
+                       detailed = TRUE)
+mem_Event
+
+# posthoc 
+aov_model <- aov(eventDets ~ valenceCategory + Error(subID/valenceCategory), data = mem.data)
+emmeans_result <- emmeans(aov_model, ~ valenceCategory)
+pairs(emmeans_result, adjust = "tukey")
+```
+
+
+perceptual details 
+```{r}
+mem_vis <-ezANOVA(data = mem.data,
+                       dv = .(visualDets),
+                       wid = .(subID),
+                       within = .(valenceCategory),
+                       type = 3,
+                       detailed = TRUE)
+mem_vis
+
+
+# posthoc 
+aov_model <- aov(visualDets ~ valenceCategory + Error(subID/valenceCategory), data = mem.data)
+emmeans_result <- emmeans(aov_model, ~ valenceCategory)
+pairs(emmeans_result, adjust = "tukey")
+```
+
+follow-up t-tests: 
+```{r}
+# Narrative details 
+valence_summary_event <- mem.data %>%
+  group_by(subID, valenceCategory) %>%
+  summarise(mean_event = mean(eventDets), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = valenceCategory, values_from = mean_event)
+
+# Positive vs Negative
+t.test(valence_summary_event$pos, valence_summary_event$neg, paired = TRUE)
+  
+# Positive vs Neutral
+t.test(valence_summary_event$pos, valence_summary_event$neu, paired = TRUE)
+
+# Negative vs Neutral
+t.test(valence_summary_event$neg, valence_summary_event$neu, paired = TRUE)
+```
+
+```{r}
+# Perceptual details 
+valence_summary_vis <- mem.data %>%
+  group_by(subID, valenceCategory) %>%
+  summarise(mean_vis = mean(visualDets), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = valenceCategory, values_from = mean_vis)
+
+# Positive vs Negative
+t.test(valence_summary_vis$pos, valence_summary_vis$neg, paired = TRUE)
+  
+# Positive vs Neutral
+t.test(valence_summary_vis$pos, valence_summary_vis$neu, paired = TRUE)
+
+# Negative vs Neutral
+t.test(valence_summary_vis$neg, valence_summary_vis$neu, paired = TRUE)
+```
+
+
+```{r}
+# Overall correct details 
+valence_summary_cor <- mem.data %>%
+  group_by(subID, valenceCategory) %>%
+  summarise(mean_correct = mean(correctDetails), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = valenceCategory, values_from = mean_correct)
+
+valence_summary_cor
+
+# Positive vs Negative
+t.test(valence_summary_cor$pos, valence_summary_cor$neg, paired = TRUE)
+  
+# Positive vs Neutral
+t.test(valence_summary_cor$pos, valence_summary_cor$neu, paired = TRUE)
+
+# Negative vs Neutral
+t.test(valence_summary_cor$neg, valence_summary_cor$neu, paired = TRUE)
+```
+
+## Figure 1d (detail counts by valence)
+
+```{r}
+# behavcolors <- c("#f76c67","#67aaf7","#0bca81","#f6a84f","#9c67f7","#67f7f0","#7F7F7F")
+
+ll = ggplot(data = behav_plot_nocorrectdets, aes(x = detail, y = mean, fill = valenceCategory)) +
+  geom_bar(stat = "identity", position = position_dodge(), alpha = 0.60, color = "black") +
+  
+  # Set fill colors for the bars and specify legend labels
+  scale_fill_manual(values = c("neg" = "#e3401a",  # Red for negative
+                               "neu" = "#1f78b4",   # Blue for neutral
+                               "pos" = "#33a02c"),  # Green for positive
+                    labels = c("neg" = "negative", "neu" = "neutral", "pos" = "positive"),
+                     name = "Valence") + 
+
+  labs(x = "Detail type", y = "Mean details recalled") + 
+  scale_y_continuous(limits = c(0, 8), expand = c(0, 0)) +
+  scale_x_discrete(labels = c("narrative", "perceptual")) + 
+  
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.title = element_text(size = 8), 
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.4, "cm"), 
+    axis.line = element_line(colour = "black")
+  ) + 
+  geom_errorbar(data = behav_plot_nocorrectdets, stat = "identity", width = 0, 
+                position = position_dodge(width = 0.9),
+                aes(x = detail, group = valenceCategory, ymax = mean + se, ymin = mean - se)) +
+
+  # Overlay individual data points
+  geom_point(data = means_individ_long, aes(x = detail, y = mean, color = valenceCategory), 
+             position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.9), 
+             alpha = 0.6, size = 1.5, show.legend = TRUE) + 
+  
+  # Set color mapping for the individual points and specify legend labels
+  scale_color_manual(values = c("neg" = "#e3401a",  # Red for negative
+                                "neu" = "#1f78b4",   # Blue for neutral
+                                "pos" = "#33a02c"),  # Green for positive
+                     labels = c("neg" = "negative", "neu" = "neutral", "pos" = "positive"),
+                     name="Valence")  # Ensure colors match the bars
+
+ll
+
+# UNCOMMENT and INSERT PATH to export 
+# ggsave(filename = 'insert-path',
+#        plot = ll,
+#        device = "png",
+#        dpi = 300,
+#        width = 3.1,
+#        height = 2.5,
+#        units = "in")
+
+```
+
+
+# Analysis: anterior/posterior hipp
+
+## setup 
+```{r}
+# import activity data
+subjects <- list.files(path='/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/hipp-recall-block15s/',full.names=TRUE, recursive = TRUE, pattern = 'block15s_timepoint-averages')
+actdata2  = do.call(rbind, lapply(subjects, function(x) {read.csv(x, header = TRUE)}))
+
+# join behavioral and activity data 
+alldata2 <- left_join(actdata2,behav.all,by=c("subID","videoName","trial"),suffix=c(".act",".beh"))
+
+# define factors 
+alldata2$ROI <- as.factor(alldata2$ROI)
+alldata2$conditionName <- as.factor(alldata2$conditionName)
+alldata2$valenceCategory <- as.factor(alldata2$valenceCategory)
+alldata2$subID <- as.factor(alldata2$subID)
+alldata2$regRound.categ <- as.factor(alldata2$regRound) # keep both integer & categorical versions
+alldata2$videoName <- as.factor(alldata2$videoName)
+alldata2$periodLabel <- as.factor(alldata2$periodLabel)
+```
+
+```{r}
+### add z score of activity estimates within region and subject and time-period
+alldata2 <- alldata2 %>%
+  group_by(subID, ROI, periodLabel) %>%
+  mutate(Z = zscore(regulationActivity)) %>%
+  ungroup()
+
+# remove betas that are > 4SD 
+tmp <- alldata2 %>%
+  mutate(isOutlier = ifelse(abs(Z)>4,TRUE,FALSE))
+
+# Following Cooper & Ritchey, remove trials where mean for ANY ROI is an outlier
+outliers <- tmp %>%
+  select(isOutlier,subID,trial) %>%
+  filter(isOutlier) %>%
+  unique()
+alldata2 <- left_join(alldata2,outliers,by=c("subID","trial"))
+alldata2$isOutlier[is.na(alldata2$isOutlier)] <- FALSE
+
+# Summarize number of outliers
+table(alldata2$subID,alldata2$isOutlier)
+table(alldata2$isOutlier)
+
+alldata2$regulationActivity[alldata2$isOutlier] <- NA  #mark value as NA if outlier
+```
+
+```{r}
+# TRIAL FILTERS
+alldata2 <- alldata2 %>%
+  mutate(isComplete.emo = ifelse(is.na(valenceChange) | is.na(arousalChange),
+                             FALSE,TRUE))
+
+# Removing negative reappraisal trials
+alldata2 <- alldata2 %>%
+  filter(conditionName == "remember")
+
+alldata2 <- alldata2 %>%
+  filter(remembered == "1") # remembered-only 
+```
+
+
+```{r}
+alldata2 <- alldata2 %>%
+  group_by(subID,ROI,periodLabel) %>% 
+  mutate(regSuccess = scale(regSuccess,scale=FALSE),
+         valenceChange = scale(valenceChange,scale=FALSE),
+         arousalChange = scale(arousalChange,scale=FALSE),
+         recallVividness = scale(recallVividness,scale=FALSE),
+         eventDets = scale(eventDets, scale =FALSE), 
+         visualDets = scale(visualDets, scale=FALSE),
+         correctDetails = scale(correctDetails, scale=FALSE)) %>% # mean-center within subject
+  ungroup()
+
+# double check that this worked as expected
+tmp <- alldata2 %>% filter(valenceCategory=="neg" & ROI=="AntHipp_L") %>% group_by(subID) %>% summarize(meansucc = mean(regSuccess,na.rm=TRUE))
+
+```
+
+## analysis
+```{r}
+alldata2$ROI = as.factor(alldata2$ROI)
+rois <- levels(alldata2$ROI)
+outDir <- '/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/reframe-detail_timepoint_results/'
+alphafdr <- .05
+
+curFile = paste0(outDir,'lme_hippocampal_rem.csv')
+### set up data frame for mixed effect model results:
+mixed.data <- data.frame(array(0,c(length(rois)*8,8)))
+colnames(mixed.data) <- c('ROI','Period','Predictor','Beta','SE','T','Df','Pvalue')
+row = 0
+
+model.data <- alldata2
+periodLabel <- as.character(model.data$periodLabel[1])
+
+
+# ******** run linear mixed effects model within each ROI and store results **********
+for (r in 1:length(rois)) {
+  
+  thisROI <- as.character(rois[r])
+  
+  roiData <- filter(model.data, ROI == thisROI)
+  roiData$regSuccess <- scale(roiData$regSuccess, scale = FALSE) 
+  
+  # run lmer and get fixed effect stats
+    roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "pos", "neg"))
+  full.model <- suppressMessages(lmer(regulationActivity ~ valenceCategory*eventDets + valenceCategory*visualDets+
+                                         (1|subID), data = roiData))
+  stats <- summary(full.model)$coefficients
+  nIV <- nrow(stats) - 1 # number of fixed effects, discounting intercept
+  
+  ### add fixed effects and p values to data frame
+  mixed.data$ROI[(row+1):(row+nIV)]      <- thisROI
+  mixed.data$Phase[(row+1):(row+nIV)]    <- periodLabel
+  mixed.data$Predictor[(row+1):(row+nIV)]  <- row.names(stats)[2:(nIV+1)]
+  mixed.data[(row+1):(row+nIV),c("Beta","SE","T","Df","Pvalue")] <- stats[2:(nIV+1),
+                                                                          c("Estimate","Std. Error","t value","df","Pr(>|t|)")]
+  row = row + nIV
+    
+}
+```
+
+```{r}
+# event.model
+event.model = mixed.data %>% filter(mixed.data$Predictor == "eventDets")
+
+p.values <- event.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.model <- cbind(event.model,Pr.fdr)
+event.model <- mutate(event.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# visual.model
+visual.model = mixed.data %>% filter(mixed.data$Predictor == "visualDets")
+
+p.values <- visual.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.model <- cbind(visual.model,Pr.fdr)
+visual.model <- mutate(visual.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+
+# pos.model
+pos.model = mixed.data %>% filter(mixed.data$Predictor == "valenceCategorypos")
+p.values <- pos.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+pos.model <- cbind(pos.model,Pr.fdr)
+pos.model <- mutate(pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(pos.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+# neg.model
+neg.model = mixed.data %>% filter(mixed.data$Predictor == "valenceCategoryneg")
+p.values <- neg.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+neg.model <- cbind(neg.model,Pr.fdr)
+neg.model <- mutate(neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+# visual.pos.model
+visual.pos.model = mixed.data %>% filter(mixed.data$Predictor == "valenceCategorypos:visualDets")
+
+p.values <- visual.pos.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.pos.model <- cbind(visual.pos.model,Pr.fdr)
+visual.pos.model <- mutate(visual.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.pos.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px")
+
+
+# visual.neg.model
+visual.neg.model =mixed.data %>% filter(mixed.data$Predictor == "valenceCategoryneg:visualDets")
+
+p.values <- visual.neg.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.neg.model <- cbind(visual.neg.model,Pr.fdr)
+visual.neg.model <- mutate(visual.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(visual.neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+# event.pos.model
+
+event.pos.model =mixed.data %>% filter(mixed.data$Predictor == "valenceCategorypos:eventDets")
+
+p.values <- event.pos.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.pos.model <- cbind(event.pos.model,Pr.fdr)
+event.pos.model <- mutate(event.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.pos.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+
+# event.neg.model
+event.neg.model = mixed.data %>% filter(mixed.data$Predictor == "valenceCategoryneg:eventDets")
+
+p.values <- event.neg.model[,8]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neg.model <- cbind(event.neg.model,Pr.fdr)
+event.neg.model <- mutate(event.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(event.neg.model,digits=3) %>% kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    scroll_box(width="1200px",height="800px") 
+```
+
+##  Figure 3c (perceptual x aHipp)
+
+```{r}
+alldata2 %>% filter(ROI != "PostHipp_L") %>% 
+  filter(ROI != "PostHipp_R") %>%
+  group_by(trial, subID) %>% 
+  summarise(eventDets, visualDets, valenceCategory, regulationActivity = mean(regulationActivity)) -> anterioract_data
+
+anterioract_data$valenceCategory <- factor(anterioract_data$valenceCategory, levels=c("neu", "pos", "neg"))
+full.model.hpca <- suppressMessages(lmer(regulationActivity ~ eventDets*valenceCategory + visualDets*valenceCategory + (1|subID), data = anterioract_data))
+
+anth = plot_visualDets_noHist(full.model.hpca, anterioract_data, "Left aHipp activity")
+anth
+
+# UNCOMMENT AND INSERT PATH to export  
+# ggsave(filename = 'insert-path',
+#        plot = anth,
+#        device = "png",
+#        dpi = 300,
+#        width = 3.5,
+#        height = 2.25,
+#        units = "in")
+```
+
+
+
+

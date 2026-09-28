@@ -1,0 +1,246 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+# inter-rater reliability 
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+
+
+coded_dir <- "/Users/ninacurko/Downloads/coded"   
+all_files <- list.files(coded_dir, pattern = "\\.xlsx$", full.names = TRUE)
+```
+
+
+```{r}
+file_info <- tibble(path = all_files) %>%
+  mutate(
+    fname  = basename(path),
+    subID  = str_extract(fname, "s[0-9]+"),          # e.g. "s009"
+    rater  = str_extract(fname, "(CF|ZT)(?=\\.xlsx$)") # last CF/ZT before .xlsx
+  ) %>%
+  filter(!is.na(subID), !is.na(rater))
+
+
+subs_both <- file_info %>%
+  count(subID, rater) %>%
+  count(subID) %>%
+  filter(n == 2) %>%
+  pull(subID)
+
+cat("Subjects scored by both raters:", paste(subs_both, collapse = ", "), "\n")
+
+
+subs_to_use <- intersect(subs_both, c("s007", "s012"))
+cat("Using subjects:", paste(subs_to_use, collapse = ", "), "\n")
+
+file_info_both <- file_info %>% filter(subID %in% subs_to_use)
+```
+
+
+```{r}
+recall.data <- data.frame()
+for (cur.file in file_info_both$path) {
+  cur.data <- read_xlsx(cur.file, n_max = 48)
+  cur.data %>%
+    mutate(coder = ifelse(grepl(pattern = "ZT", x = cur.file), "ZT",
+                          ifelse(grepl(pattern = "CF", x = cur.file), "CF", NA))) -> cur.data
+  recall.data <- bind_rows(recall.data, cur.data)
+}
+ 
+filter(recall.data, coder == "ZT") -> ztcoder_sorted
+filter(recall.data, coder == "CF") -> cfcoder_sorted
+ 
+ztcoder_sorted <- ztcoder_sorted[order(ztcoder_sorted$videoName), ]
+ztcoder_sorted <- ztcoder_sorted[order(ztcoder_sorted$subID), ]
+cfcoder_sorted <- cfcoder_sorted[order(cfcoder_sorted$videoName), ]
+cfcoder_sorted <- cfcoder_sorted[order(cfcoder_sorted$subID), ]
+ 
+
+stopifnot(nrow(ztcoder_sorted) == nrow(cfcoder_sorted))
+ 
+event_sorted   <- cor(cfcoder_sorted$eventDetails,   ztcoder_sorted$eventDetails)
+visual_sorted  <- cor(cfcoder_sorted$visualDetails,  ztcoder_sorted$visualDetails)
+correct_sorted <- cor(cfcoder_sorted$correctDetails, ztcoder_sorted$correctDetails)
+total_sorted   <- cor(cfcoder_sorted$totalDetails,   ztcoder_sorted$totalDetails)
+ 
+
+cat("Event:  ", round(event_sorted, 3),  "\n")
+cat("Visual: ", round(visual_sorted, 3), "\n")
+cat("Correct:", round(correct_sorted, 3), "\n")
+cat("Total:  ", round(total_sorted, 3), "\n")
+ 
+
+```
+
+
+
+## average number of valence related trials after motion exclusions 
+
+
+use any network.data type dataframe from other scripts
+```{r}
+trials_retained <- network.data.reviewer %>%
+  filter(conditionName == "remember") %>%          
+  distinct(subID, trial, valenceCategory) %>%      # one row per trial per subject
+  group_by(subID, valenceCategory) %>%
+  summarise(n_trials = n(), .groups = "drop") %>%
+  group_by(valenceCategory) %>%
+  summarise(
+    mean_trials = mean(n_trials),
+    sd_trials   = sd(n_trials),
+    min_trials  = min(n_trials),
+    max_trials  = max(n_trials),
+    n_subjects  = n(),
+    .groups = "drop"
+  )
+ 
+print(trials_retained)
+ 
+```
+
+
+
+# emotional valence categories and continuous valence ratings 
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+#using mem.data from main univariate script - you may have to specify a path for this to work. 
+mem.data = readRDS("mem.data_reframe-detail.rds")
+
+
+valence_df <- mem.data %>%
+  filter(conditionName == "remember") %>%
+  group_by(subID, cueWord, valenceCategory) %>%
+  summarise(
+    encValence = first(na.omit(encValence)),
+    .groups = "drop"
+  )
+
+cat("Total rows:", nrow(valence_df), "\n")
+cat("Rows with a usable rating:", sum(!is.na(valence_df$encValence)), "\n\n") # some ratings weren't completed 
+
+# Set factor order
+valence_df$valenceCategory <- factor(
+  valence_df$valenceCategory,
+  levels = c("neg", "neu", "pos"))
+```
+
+```{r}
+descriptives <- valence_df %>%
+  group_by(valenceCategory) %>%
+  summarise(
+    mean_rating = round(mean(encValence, na.rm = TRUE), 2),
+    sd_rating   = round(sd(encValence, na.rm = TRUE), 2),
+    n           = sum(!is.na(encValence)),
+    .groups = "drop"
+  )
+
+print(descriptives)
+```
+
+```{r}
+anova_model <- aov(
+  encValence ~ valenceCategory,
+  data = valence_df
+)
+
+print(summary(anova_model))
+
+ss <- summary(anova_model)[[1]][["Sum Sq"]]
+eta_sq <- ss[1] / sum(ss)
+
+cat("Eta-squared:", round(eta_sq, 3), "\n\n")
+
+print(TukeyHSD(anova_model))
+```
+
+## Figure 1c
+
+
+calc subject means for plotting 
+```{r}
+subject_means <- valence_df %>%
+  group_by(subID, valenceCategory) %>%
+  summarise(
+    mean_enc = mean(encValence, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+
+p_box <- ggplot(
+  subject_means,
+  aes(x = valenceCategory, y = mean_enc)
+) +
+  geom_boxplot(
+    aes(fill = valenceCategory),
+    width = 0.5,
+    alpha = 0.6,
+    outlier.shape = NA,
+    color = "black"
+  ) +
+  geom_jitter(
+    aes(color = valenceCategory),
+    width = 0.08,
+    size = 1.5,
+    alpha = 0.4
+  ) +
+  scale_x_discrete(
+    labels = c(
+      "neg" = "negative",
+      "neu" = "neutral",
+      "pos" = "positive"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "neg" = "#e3401a",
+      "neu" = "#1f78b4",
+      "pos" = "#33a02c"
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "neg" = "#e3401a",
+      "neu" = "#1f78b4",
+      "pos" = "#33a02c"
+    )
+  ) +
+  labs(
+    x = "Valence category",
+    y = "Mean valence rating at encoding"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.position = "none",
+    axis.line = element_line(colour = "black")
+  )
+
+print(p_box)
+
+
+## FOR EXPORT (uncomment + insert path)
+# ggsave(filename = 'insert-path',
+#        plot = p_box,
+#        device = "png",
+#        dpi = 300,
+#        width = 2.6,
+#        height = 2.5,
+#        units = "in")
+```

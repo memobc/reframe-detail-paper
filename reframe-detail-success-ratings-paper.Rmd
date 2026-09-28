@@ -1,0 +1,424 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Behavioral analysis
+
+
+## setup 
+This script uses the behav.all dataframe from the univariate network script. 
+
+First: make sure we are using the right trial type: 
+
+```{r}
+behav.all.here = behav.all %>% filter(remembered==1,conditionName == "remember")
+
+behav.remembered = behav.all %>% filter(remembered==1,conditionName == "remember")
+behav_nr = behav.all %>% filter(conditionName == "remember")
+
+
+# make sure all variables are factors 
+behav.remembered$valenceCategory <- as.factor(behav.remembered$valenceCategory)
+behav.remembered$subID <- as.factor(behav.remembered$subID)
+behav.remembered$cueWord <- as.factor(behav.remembered$cueWord)
+
+behav_nr$valenceCategory <- as.factor(behav_nr$valenceCategory)
+behav_nr$subID <- as.factor(behav_nr$subID)
+behav_nr$cueWord <- as.factor(behav_nr$cueWord)
+
+behav.all.here$valenceCategory <- as.factor(behav.all.here$valenceCategory)
+behav.all.here$subID <- as.factor(behav.all.here$subID)
+behav.all.here$cueWord <- as.factor(behav.all.here$cueWord)
+
+
+behav.all.here = behav.all.here%>%
+  group_by(subID) %>% 
+  mutate(regSuccess = scale(regSuccess,scale=FALSE),
+         recallVividness = scale(recallVividness,scale=FALSE),
+         eventDets = scale(eventDets, scale =FALSE), 
+         visualDets = scale(visualDets, scale=FALSE),
+         correctDetails = scale(correctDetails, scale=FALSE)) %>% # mean-center within subject
+  ungroup()
+behav.by.video = behav.all.here %>% group_by(subID, cueWord, valenceCategory) %>%
+  summarize(meanSuccess = mean(regSuccess, na.rm=TRUE),
+            recallVividness = mean(recallVividness, na.rm=TRUE),
+            eventDets = mean(eventDets),
+            visualDets = mean(visualDets),
+            correctDetails = mean(correctDetails)
+                              )
+
+```
+
+```{r}
+
+# look at success standard deviations 
+success_sd = behav.all.here %>%
+  group_by(valenceCategory) %>%
+  summarize(SD_success = sd(regSuccess, na.rm = TRUE))
+
+success_sd
+
+```
+
+
+
+## success x vividness
+
+how do the average success ratings predict subsequent vividness ratings? does this vary by valence? 
+
+```{r}
+# vividness
+behav.by.video$valenceCategory <- factor(behav.by.video$valenceCategory, levels=c("neu", "neg", "pos"))
+mod_viv <- lmer(recallVividness ~ meanSuccess * valenceCategory + (1|subID), data=behav.by.video)
+summary(mod_viv)
+```
+
+## success x details 
+How do Day 2 details relate to Day 1 success ratings? 
+```{r}
+# details
+mod_event <- lmer(eventDets ~ meanSuccess * valenceCategory + (1|subID), data=behav.by.video)
+summary(mod_event)
+
+mod_percept <- lmer(visualDets ~ meanSuccess * valenceCategory + (1|subID), data=behav.by.video)
+summary(mod_percept)
+
+mod_overall <- lmer(correctDetails ~ meanSuccess * valenceCategory + (1|subID), data=behav.by.video)
+summary(mod_overall)
+```
+
+all variables: 
+```{r}
+mod_success <- lmer(meanSuccess ~ eventDets * valenceCategory + visualDets* valenceCategory + (1|subID), data=behav.by.video)
+summary(mod_success)
+```
+
+
+
+## spread of ratings 
+behav.remembered = just remembered, before scaling
+behav_nr = remembered and non-remembered, before scaling
+
+```{r}
+# summary + counts
+table(behav.remembered$regSuccess)
+
+# or proportions
+prop.table(table(behav.remembered$regSuccess))
+
+# summary stats
+summary(behav.remembered$regSuccess)
+```
+
+
+by valence: 
+```{r}
+table(behav.remembered$valenceCategory, behav.remembered$regSuccess)
+
+# or proportion by valence group
+prop.table(table(behav.remembered$valenceCategory, behav.remembered$regSuccess), margin = 1)
+
+```
+
+## Extended Data Figure 1-1a: success x frequency
+
+```{r}
+ frequency_labs <- c("1", "2", "3", "4", "5", "no response")
+
+frequency_plot <- ggplot(behav.remembered, aes(x = factor(regSuccess), fill = valenceCategory)) +
+  geom_bar(position = "dodge", color = "black", alpha = 0.60) +
+  scale_fill_manual(values = c("neu" = "#1f78b4", 
+                               "neg" = "#e3401a", 
+                               "pos" = "#33a02c"),
+                    labels = c("neu" = "neutral", 
+                              "neg" = "negative", 
+                              "pos" = "positive"),
+                    name = "Valence") +
+  labs(x = "Success rating", 
+       y = "Frequency across trials",
+       title = NULL) +
+  scale_x_discrete(labels = frequency_labs) +
+  theme_classic() +
+  theme(
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text = element_text(size = 8),
+    legend.title = element_text(size = 8), 
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.4, "cm"),
+    axis.line = element_line(colour = "black")
+  )
+
+frequency_plot
+
+
+# ggsave(filename = 'insert-path',
+#        plot = frequency_plot,
+#        device = "png",
+#        dpi = 300,
+#        width = 4,
+#        height = 3,
+#        units = "in")
+```
+
+
+## success x valence
+
+```{r}
+behav.remembered$valenceCategory <- factor(behav.remembered$valenceCategory, levels=c("neu", "neg", "pos"))
+
+lmm_success <- lmer(regSuccess ~ valenceCategory + (1 | subID), data = behav.remembered)
+summary(lmm_success)
+```
+
+```{r}
+
+# alt reference category 
+behav.remembered$valenceCategory <- factor(behav.remembered$valenceCategory, levels=c("neg", "neu", "pos"))
+
+lmm_success <- lmer(regSuccess ~ valenceCategory + (1 | subID), data = behav.remembered)
+summary(lmm_success)
+
+
+behav.remembered$valenceCategory <- factor(behav.remembered$valenceCategory, levels=c("neu", "neg", "pos"))
+
+```
+
+
+
+
+# Success and univariate fMRI activity  
+
+This section uses the alldata dataframe from parcel_remembered_only.qmd. 
+
+it should already be filtered as needed but let's check again it's the right condition and remembered-only
+```{r}
+alldata <- alldata %>%
+  filter(conditionName == "remember")
+
+ alldata <- alldata %>% filter(remembered == 1)  
+
+```
+
+create fMRI/success dataframe 
+```{r}
+include_networks = c("DefaultA", "DefaultB", "DefaultC")
+
+# Summarize data
+alldata %>%
+  # filter to include only some rows
+  filter(network %in% include_networks) %>%
+  # average over ROIs within a network
+  group_by(subID,trial,network, eventDets, visualDets, correctDetails, regSuccess, valenceCategory) %>% 
+  summarize(regulationActivity = mean(regulationActivity,na.rm=TRUE)) %>%
+  ungroup() -> network.data.success
+```
+
+
+## setup model 
+
+```{r}
+include_networks = c("DefaultA", "DefaultB", "DefaultC")
+
+model.stats.s = data.frame()
+
+successfunction <- function(curROI, model.stats.s) {
+
+  # subset data for this ROI
+ # model
+  roiData <- network.data.success %>% filter(network %in% curROI)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+
+  
+  # skip if there’s no data
+  if (nrow(roiData) == 0) {
+    message("Skipping ROI: ", curROI, " (no data)")
+    return(model.stats.s)  # just return the existing stats
+  }
+
+  # fit model
+  full.model <- lmer(regulationActivity ~ regSuccess*valenceCategory +
+                       (1|subID), data = roiData)
+  
+  # extract stats
+  stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats, ROI=curROI)
+  model.stats.s <- rbind(model.stats.s, stats)
+   print(tab_model(full.model,title="detail x emotion, neutral reference"))
+                  
+  return(model.stats.s)
+}
+
+
+model.stats.s <- successfunction("DefaultA",model.stats.s)
+model.stats.s <- successfunction("DefaultB",model.stats.s)
+model.stats.s <- successfunction("DefaultC",model.stats.s)
+
+```
+
+## results
+```{r}
+# valenceCategoryneg main effect
+valence.neg.model = model.stats.s %>%
+    filter((row.names(model.stats.s) == "valenceCategoryneg") |
+           (row.names(model.stats.s) == "valenceCategoryneg1") |
+           (row.names(model.stats.s) == "valenceCategoryneg2"))
+p.values <- valence.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+valence.neg.model <- cbind(valence.neg.model,Pr.fdr)
+valence.neg.model <- mutate(valence.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(valence.neg.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# valenceCategorypos main effect
+valence.pos.model = model.stats.s %>%
+    filter((row.names(model.stats.s) == "valenceCategorypos") |
+           (row.names(model.stats.s) == "valenceCategorypos1") |
+           (row.names(model.stats.s) == "valenceCategorypos2"))
+p.values <- valence.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+valence.pos.model <- cbind(valence.pos.model,Pr.fdr)
+valence.pos.model <- mutate(valence.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(valence.pos.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# regSuccess:valenceCategoryneg interaction
+succ.neg.model = model.stats.s %>%
+    filter((row.names(model.stats.s) == "regSuccess:valenceCategoryneg") |
+           (row.names(model.stats.s) == "regSuccess:valenceCategoryneg1") |
+           (row.names(model.stats.s) == "regSuccess:valenceCategoryneg2"))
+p.values <- succ.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+succ.neg.model <- cbind(succ.neg.model,Pr.fdr)
+succ.neg.model <- mutate(succ.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(succ.neg.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# regSuccess:valenceCategorypos interaction
+succ.pos.model = model.stats.s %>%
+    filter((row.names(model.stats.s) == "regSuccess:valenceCategorypos") |
+           (row.names(model.stats.s) == "regSuccess:valenceCategorypos1") |
+           (row.names(model.stats.s) == "regSuccess:valenceCategorypos2"))
+p.values <- succ.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+succ.pos.model <- cbind(succ.pos.model,Pr.fdr)
+succ.pos.model <- mutate(succ.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(succ.pos.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+
+#regSuccess main effect
+success.model = model.stats.s %>%
+    filter((row.names(model.stats.s) == "regSuccess") |
+           (row.names(model.stats.s) == "regSuccess1") |
+           (row.names(model.stats.s) == "regSuccess2"))
+p.values <- success.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+success.model <- cbind(success.model,Pr.fdr)
+success.model <- mutate(success.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(success.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+```
+
+## Extended Data Figure 1-1b: success x activity 
+
+
+
+```{r}
+
+library(lme4)
+library(ggeffects)
+library(ggplot2)
+library(dplyr)
+library(purrr)
+
+# make sure valence order is consistent
+network.data.success$valenceCategory <- factor(network.data.success$valenceCategory,
+                                               levels = c("neu", "neg", "pos"))
+
+# define function to run model + extract predictions for one network
+get_preds <- function(cur_net) {
+  dat <- network.data.success %>% filter(network == cur_net)
+  
+  if (nrow(dat) == 0) return(NULL)
+  
+  mod <- lmer(regulationActivity ~ regSuccess * valenceCategory + (1|subID), data = dat)
+  preds <- ggpredict(mod, terms = c("regSuccess [all]", "valenceCategory"), type = "fixed")
+  preds$network <- cur_net
+  return(preds)
+}
+
+# run for all three subnetworks
+include_networks <- c("DefaultA", "DefaultB", "DefaultC")
+pred_activity_all <- map_dfr(include_networks, get_preds)
+
+# relabel for pretty facets
+pred_activity_all$network <- recode(pred_activity_all$network,
+                                    "DefaultA" = "Core midline",
+                                    "DefaultB" = "Dorsomedial",
+                                    "DefaultC" = "Medial temporal")
+
+# plot combined predictions
+activity_plot <- ggplot(pred_activity_all, 
+                        aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1.1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, color = NA) +
+  facet_wrap(~ network, nrow = 1) +
+  scale_color_manual(values = c("neu" = "#1f78b4",
+                                "neg" = "#e3401a",
+                                "pos" = "#33a02c"),
+                     labels = c("Neutral", "Negative", "Positive"),
+                     name = "Valence") +
+  scale_fill_manual(values = c("neu" = "#1f78b4",
+                               "neg" = "#e3401a",
+                               "pos" = "#33a02c"),
+                    labels = c("Neutral", "Negative", "Positive"),
+                    name = "Valence") +
+  labs(x = "Subjective success rating (mean centered)",
+       y = "Network activity")+
+  theme_classic(base_size = 10) +
+ theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.4, "cm"),
+    axis.line.x = element_line(color = "black", size = .5), 
+    axis.line.y = element_line(color = "black", size = .5), 
+    axis.title.y = element_text(size = 10),
+    axis.title.x = element_text(size = 10), 
+    axis.text.y = element_text(size = 8), 
+    axis.text.x = element_text(size = 8),
+    plot.title = element_blank(),
+    axis.ticks = element_line(color = "black", size = .5),
+    axis.ticks.length = unit(0.1, "cm")
+  )
+
+activity_plot
+
+
+
+# ggsave(filename = 'insert-path',
+#        plot = activity_plot,
+#        device = "png",
+#        dpi = 300,
+#        width = 5.5,
+#        height = 3.25,
+#        units = "in")
+```
+
+
+
+

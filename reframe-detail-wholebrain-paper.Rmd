@@ -1,0 +1,1522 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+# Initialize 
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(ez)
+library(ggsegSchaefer)
+library(ggseg3d)
+library(ggseg)
+library(sjPlot)
+library(kableExtra)
+library(corrplot)
+library(ggpubr)
+library(here)
+library(glue)
+library(officer)
+library(rvg)
+library(emmeans)
+
+
+zscore <- function(x) (x-mean(x))/sd(x)
+se <- function(x) sqrt(var(x)/length(x))  #function to calculate SE
+ci <- function(x) (sqrt(var(x)/length(x))) * 1.96  #function to calculate 95% CI
+```
+
+setting up plotting theme: 
+```{r}
+{r}
+fontsize <- 14
+linesize <- .5
+barcolors <- c("#f76c67","#67aaf7","#0bca81","#f6a84f","#9c67f7","#67f7f0","#7F7F7F")
+
+my_theme <- function() {
+    theme(plot.title = element_text(hjust = 0.5, size=fontsize, margin=margin(0,0,20,0)),
+        axis.line.x = element_line(color = "black", size = 1), 
+        axis.line.y = element_line(color = "black", size = 1),
+        axis.text.x = element_text(size = .8*fontsize, hjust=1, vjust=1, angle = 45),
+        axis.text.y = element_text(size = .8*fontsize), 
+        axis.title.y = element_text(size = 1*fontsize),
+        axis.title.x = element_blank(), 
+        panel.background = element_blank(),
+        legend.position="none", 
+        strip.text.x = element_text(size=fontsize), 
+        text = element_text(family="Helvetica")) # +
+  # theme(plot.margin = margin(1, 1, 1, 1, "cm"))
+}
+```
+
+## Load data
+
+### behavioral data: 
+```{r}
+behav <- read.csv('/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/behav_data_allonsets.csv')
+
+behav <- behav %>%
+  filter(period=="recall") # keep only one row per trial
+
+nina_behav <- read.csv('/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/onsets_all.csv')
+nina_behav <- nina_behav %>%
+  filter(period=="recall")
+
+behav$eventDet = nina_behav$eventDetails.y # adding nina's add'l coding 
+behav$visualDet = nina_behav$visualDetails.y
+
+
+# add in missing data from nina's coding 
+missing = read.csv('/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/missing_coded.csv')
+behav <- behav %>%
+  left_join(missing, by = c("subID", "videoName"))
+behav$eventDets = ifelse(is.na(behav$eventDet.x), behav$eventDet.y, behav$eventDet.x)
+behav$visualDets = ifelse(is.na(behav$visualDet.x), behav$visualDet.y, behav$visualDet.x)
+
+# remove unnecessary columns 
+behav = behav %>% select(-eventDet.x, -visualDet.x, -eventDet.y, -visualDet.y)
+
+
+table(behav$subID,behav$run)
+nsub.behav <- length(unique(behav$subID))
+
+# Some video info is contained only for the first round. Make sure it's repeated for other rounds. 
+behav.roundone <- behav %>% 
+  filter(regRound==1) %>%
+  select("subID","videoName","recallValence","recallArousal","recallVividness",
+         "encValence","encArousal","valenceChange","arousalChange","successful",
+         "remembered","correctDetails", "eventDets", "visualDets")
+behav.left <- behav[,1:18]
+
+behav.all <- full_join(behav.left,behav.roundone,by=c("subID","videoName"),
+                       suffix=c("",".ignore"))
+
+
+# no event/visual detail column should have "NA" - replace with zero. 
+
+behav.all$eventDets = ifelse(is.na(behav.all$eventDets), 0, behav.all$eventDets)
+behav.all$visualDets = ifelse(is.na(behav.all$visualDets), 0, behav.all$visualDets)
+```
+
+
+### activity data: 
+
+```{r}
+subjects <- list.files(path='/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/redo/',full.names=TRUE, recursive = TRUE, pattern = 'block15s_timepoint-averages_schaefer')
+actdata  = do.call(rbind, lapply(subjects, function(x) {read.csv(x, header = TRUE)}))
+
+
+tmp <- filter(actdata,ROI=="LH_HIPP")
+table(tmp$subID,tmp$run)
+nsub.act <- length(unique(actdata$subID))
+```
+
+
+
+
+### join activity and behavioral data: 
+
+```{r}
+# first fix subID numbers to follow same format
+behav.all <- behav.all %>%
+  mutate(subID.orig = subID,
+         subID = paste0("sub-",subID.orig))
+
+alldata <- left_join(actdata,behav.all,by=c("subID","videoName","trial"),suffix=c(".act",".beh"))
+```
+
+
+
+### summarize trial numbers per condition: 
+
+```{r}
+tmp <- filter(alldata,ROI=="LH_HIPP" & subID=="sub-s002")
+table(tmp$conditionName,tmp$valenceCategory)
+```
+
+
+
+
+# Clean up / set up 
+
+
+### define factors 
+```{r}
+alldata$ROI <- as.factor(alldata$ROI)
+alldata$conditionName <- as.factor(alldata$conditionName)
+alldata$valenceCategory <- as.factor(alldata$valenceCategory)
+alldata$subID <- as.factor(alldata$subID)
+alldata$regRound.categ <- as.factor(alldata$regRound) # keep both integer & categorical versions
+alldata$videoName <- as.factor(alldata$videoName)
+alldata$periodLabel <- as.factor(alldata$periodLabel)
+```
+
+### remove outliers
+
+```{r}
+### add z score of activity estimates within region and subject and time-period
+alldata <- alldata %>%
+  group_by(subID, ROI, periodLabel) %>%
+  mutate(Z = zscore(regulationActivity)) %>%
+  ungroup()
+
+# remove betas that are > 4SD 
+tmp <- alldata %>%
+  mutate(isOutlier = ifelse(abs(Z)>4,TRUE,FALSE))
+
+# Following Cooper & Ritchey, remove trials where mean for ANY ROI is an outlier
+outliers <- tmp %>%
+  select(isOutlier,subID,trial) %>%
+  filter(isOutlier) %>%
+  unique()
+alldata <- left_join(alldata,outliers,by=c("subID","trial"))
+alldata$isOutlier[is.na(alldata$isOutlier)] <- FALSE
+
+# Summarize number of outliers
+table(alldata$subID,alldata$isOutlier)
+table(alldata$isOutlier)
+
+alldata$regulationActivity[alldata$isOutlier] <- NA  #mark value as NA if outlier
+```
+
+
+
+### set up trial filters
+Include trials with success ratings greater than zero - Use successful==1 (video level rating, see ms) or regSuccess>=1 (trial level rating)
+
+Include trials that were remembered during delayed recall - Use remembered==1
+
+Include trials only for remember, not reappraise - Use conditionName == "remember"
+
+```{r}
+alldata <- alldata %>%
+  mutate(isComplete.emo = ifelse(is.na(valenceChange) | is.na(arousalChange),
+                             FALSE,TRUE))
+
+# Removing negative reappraisal trials
+alldata <- alldata %>%
+  filter(conditionName == "remember")
+
+
+all_nr = alldata # capturing all trials, not just remembered 
+ alldata <- alldata %>% filter(remembered == 1) # IF UNCOMMENTED, ONLY LOOKING AT REMEMBERED TRIALS. 
+```
+
+
+
+### mean centering predictors 
+within-participants
+
+```{r}
+alldata <- alldata %>%
+  group_by(subID,ROI,periodLabel) %>% 
+  mutate(regSuccess = scale(regSuccess,scale=FALSE),
+         valenceChange = scale(valenceChange,scale=FALSE),
+         arousalChange = scale(arousalChange,scale=FALSE),
+         recallVividness = scale(recallVividness,scale=FALSE),
+         eventDets = scale(eventDets, scale =FALSE), 
+         visualDets = scale(visualDets, scale=FALSE),
+         correctDetails = scale(correctDetails, scale=FALSE)) %>% # mean-center within subject
+  ungroup()
+
+# double check that this worked as expected
+tmp <- alldata %>% filter(valenceCategory=="neg" & ROI=="LH_HIPP") %>% group_by(subID) %>% summarize(meansucc = mean(regSuccess,na.rm=TRUE))
+```
+
+
+
+
+### get ROI info 
+
+```{r}
+alldata %>%
+  ungroup() %>%
+  filter(subID=="sub-s005" & trialID==8) %>%
+  mutate(ROIsplit = ROI)  %>%
+  separate(ROIsplit, into = c("hemisphere", "network", "netregion"), sep = "_", extra = "merge") %>%
+  select(ROI,hemisphere,network,netregion) -> roi_info
+
+alldata <- left_join(alldata,roi_info,by=c("ROI"))
+tempdf = alldata %>%
+  filter(subID=="sub-s005" & ROI=="DefaultC")
+```
+
+
+# Analysis 
+```{r}
+rois <- levels(alldata$ROI)
+outDir <- '/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/reframe-detail_timepoint_results/'
+alphafdr <- .05
+```
+
+get ROI-level activity (and not go a step further to network-level activity)
+```{r}
+
+alldata %>%
+ # filter(network %in% include_networks) %>% # this limits everything to only the 3 DMN subnetworks. 
+  group_by(subID, trial, ROI, eventDets, visualDets, correctDetails, valenceCategory) %>%
+  summarize(regulationActivity = mean(regulationActivity, na.rm = TRUE)) %>%
+  ungroup() -> roi.data
+```
+
+## Set up function for running model 
+
+```{r}
+detail_emo_neuref <- function(curROI, model.stats) {
+
+  # subset data for this ROI
+  roiData <- roi.data %>% filter(as.character(ROI) == curROI)
+  
+  # skip if there’s no data
+  if (nrow(roiData) == 0) {
+    message("Skipping ROI: ", curROI, " (no data)")
+    return(model.stats)  # just return the existing stats
+  }
+  
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  
+  # fit model
+  full.model <- lmer(regulationActivity ~ visualDets + eventDets +
+                       visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  
+  # extract stats
+  stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats, ROI=curROI)
+  model.stats <- rbind(model.stats, stats)
+  
+  return(model.stats)
+}
+
+```
+
+## loop over all ROIs to run the model 
+
+```{r}
+model.stats <- data.frame(
+  term = character(),
+  estimate = numeric(),
+  std.error = numeric(),
+  statistic = numeric(),
+  p.value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+rois <- levels(alldata$ROI)   # all ROIs in the df 
+
+for (r in rois) {
+  model.stats <- detail_emo_neuref(r, model.stats)
+}
+
+# move the row names of model.stats into a proper column - causing errors if you don't
+if (is.null(model.stats$term)) {
+  model.stats <- model.stats %>%
+    tibble::rownames_to_column(var = "term")
+}
+```
+
+
+# FDR-corrected results 
+
+
+## narrative details 
+```{r}
+# Select all eventDets rows
+event.model <- model.stats %>%
+  filter(grepl("^eventDets[0-9]*$", term))   # ^ matches "eventDets", "eventDets1", ..., "eventDets41"
+
+
+# FDR correction
+p.values <- event.model[,6] # p-value column is in column 6
+event.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.model <- event.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# display table below 
+kbl(event.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+```
+
+
+## perceptual details 
+```{r}
+# Select all visualDets rows, including numbered ones up to visualDets41
+visual.model <- model.stats %>%
+  filter(grepl("^visualDets[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- visual.model[,6]  
+visual.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.model <- visual.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(visual.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+```
+
+## positive valence
+```{r}
+pos.model <- model.stats %>%
+  filter(grepl("^valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- pos.model[,6]  
+pos.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+pos.model <- pos.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(pos.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+## negative valence
+```{r}
+neg.model <- model.stats %>%
+  filter(grepl("^valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- neg.model[,6]  
+neg.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+neg.model <- neg.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(neg.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+## perceptual x positive 
+
+```{r}
+vis.pos.model <- model.stats %>%
+  filter(grepl("^visualDets:valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- vis.pos.model[,6]  
+vis.pos.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+vis.pos.model <- vis.pos.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(vis.pos.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+## perceptual x negative 
+```{r}
+vis.neg.model <- model.stats %>%
+  filter(grepl("^visualDets:valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- vis.neg.model[,6]  
+vis.neg.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+vis.neg.model <- vis.neg.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(vis.neg.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+## narrative x positive 
+```{r}
+event.pos.model <- model.stats %>%
+   filter(grepl("^eventDets:valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- event.pos.model[,6]  
+event.pos.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.pos.model <- event.pos.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(event.pos.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+## narrative x negative
+```{r}
+event.neg.model <- model.stats %>%
+  filter(grepl("^eventDets:valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- event.neg.model[,6]  
+event.neg.model$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neg.model <- event.neg.model %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(event.neg.model, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+## tables 
+
+```{r}
+# Combine all post-FDR data frames with appropriate labels 
+all_models <- bind_rows(
+  event.model %>% mutate(model_name = "Narrative details"),
+  visual.model %>% mutate(model_name = "Perceptual details"),
+  pos.model %>% mutate(model_name = "Positive valence"),
+  neg.model %>% mutate(model_name = "Negative valence"),
+  event.pos.model %>% mutate(model_name = "Narrative details × Positive valence"),
+  event.neg.model %>% mutate(model_name = "Narrative details × Negative valence"),
+  vis.pos.model %>% mutate(model_name = "Perceptual details × Positive valence"),
+  vis.neg.model %>% mutate(model_name = "Perceptual details × Negative valence")
+)
+
+# Filter to only significant results
+sig_results <- all_models %>%
+  filter(sig == TRUE) %>%
+  arrange(model_name, ROI)
+
+# Display nicely
+kbl(sig_results, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+#  Clean and format for display 
+rsa_table_clean <- sig_results %>%
+  select(model_name, ROI, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # Round numeric columns
+  mutate(across(where(is.numeric), ~ signif(., 3))) %>%
+  
+  # --- Split ROI into components ---
+  separate(ROI, into = c("Hemisphere", "Network", "Region label"), sep = "_", extra = "merge") %>%
+  select(term = model_name, Network, `Region label`, Hemi = Hemisphere, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # --- Sort and group for readability ---
+  mutate(is_interaction = grepl("×", term)) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup() %>%
+  
+  # --- Format p-values ---
+  mutate(
+    Pr.fdr = case_when(
+      Pr.fdr < 0.001 ~ "p < .001",
+      Pr.fdr < 0.01  ~ "p < .01",
+      Pr.fdr < 0.05  ~ "p < .05",
+      TRUE           ~ as.character(signif(Pr.fdr, 3))
+    )
+  )
+
+# --- Display in console ---
+kable(
+  rsa_table_clean[, c("term_label", "Network", "Region label", "Hemi", "Estimate", "df", "t.value", "Pr.fdr")],
+  col.names = c("Term", "Network", "Region label", "Hemi", "Estimate", "df", "t", "p (FDR)"),
+  digits = 3,
+  format = "simple"
+)
+
+# --- Export to Word (nice formatted table) ---
+table_for_word <- rsa_table_clean %>%
+  select(
+    Term = term_label,
+    Network,
+    `Region label`,
+    Hemi,
+    Estimate,
+    df,
+    t = t.value,
+    `p (FDR)` = Pr.fdr
+  )
+
+ft <- flextable(table_for_word) %>%
+  autofit() %>%
+  theme_vanilla() %>%
+  align(j = c("Estimate", "df", "t", "p (FDR)"), align = "center", part = "all")
+
+doc <- read_docx() |> 
+  body_add_par("Activity Results: Whole Brain", style = "heading 1") |> 
+  body_add_flextable(ft)
+
+print(doc, target = "Activity_results_table_wholebrain.docx")
+
+# --- Optional: restrict to DMN only ---
+rsa_table_dmn <- rsa_table_clean %>%
+  filter(Network %in% c("DefaultA", "DefaultB", "DefaultC")) %>%
+  # Re-create term_label after filtering
+  select(-term_label) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup()
+
+ft_dmn <- flextable(rsa_table_dmn %>%
+  select(Term = term_label, Network, `Region label`, Hemi, Estimate, df, t = t.value, `p (FDR)` = Pr.fdr)) %>%
+  autofit()
+
+doc_dmn <- read_docx() |> 
+  body_add_par("Activity Results: DMN Only", style = "heading 1") |> 
+  body_add_flextable(ft_dmn)
+
+print(doc_dmn, target = "Activity_results_table_DMN_only.docx")
+
+
+```
+
+further table formatting
+```{r}
+library(dplyr)
+library(knitr)
+library(tidyr)
+
+df <- read.csv("/Users/ninacurko/Downloads/my_exported_table.csv")
+
+
+df_clean <- df %>%
+  select(term, ROI, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # Round numeric columns to 3 significant figures
+  mutate(across(where(is.numeric), ~ signif(., 3))) %>%
+  
+  # --- Clean up term names ---
+  mutate(
+    term = sub("[0-9]+$", "", term),
+    term = gsub("eventDets", "Narrative details", term),
+    term = gsub("visualDets", "Perceptual details", term),
+    term = gsub("valenceCategorypos", "Positive valence", term),
+    term = gsub("valenceCategoryneg", "Negative valence", term),
+    term = gsub(":", " × ", term)
+  ) %>%
+  
+  # --- Split ROI ---
+  separate(ROI, into = c("Hemisphere", "Network", "Region label"), sep = "_", extra = "merge") %>%
+  
+  # Move Hemisphere last and rename it
+  select(term, Network, `Region label`, Hemi = Hemisphere, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # Sort: main effects first, then interactions
+  mutate(is_interaction = grepl("×", term)) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  
+  # Label term only once per group
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup() %>%
+  
+  # --- Recode p-values ---
+  mutate(
+    Pr.fdr = case_when(
+      Pr.fdr < 0.001 ~ "p < .001",
+      Pr.fdr < 0.01  ~ "p < .01",
+      Pr.fdr < 0.05  ~ "p < .05",
+      TRUE           ~ as.character(signif(Pr.fdr, 3))
+    )
+  )
+
+# --- Print table ---
+kable(
+  df_clean[, c("term_label", "Network", "Region label", "Hemi", "Estimate", "df", "t.value", "Pr.fdr")],
+  col.names = c("Term", "Network", "Region label", "Hemi", "Estimate", "df", "t", "p (FDR)"),
+  digits = 3,
+  format = "simple"
+)
+
+
+library(flextable)
+library(officer)
+
+# make a data frame version of  clean table
+table_for_word <- df_clean %>%
+  select(Term = term_label,
+         Network,
+         `Region label`,
+         Hemi,
+         Estimate,
+         df,
+         t = t.value,
+         `p (FDR)` = Pr.fdr)
+
+# create a flextable
+ft <- flextable(table_for_word)
+ft <- autofit(ft)
+
+# export to Word
+doc <- read_docx() |>
+  body_add_flextable(ft)
+print(doc, target = "regression_table.docx")
+
+```
+
+ Table with just DMN 
+```{r}
+df_clean <- df %>%
+  select(term, ROI, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # Round numeric columns to 3 significant figures
+  mutate(across(where(is.numeric), ~ signif(., 3))) %>%
+  
+  # --- Clean up term names ---
+  mutate(
+    term = sub("[0-9]+$", "", term),
+    term = gsub("eventDets", "Narrative details", term),
+    term = gsub("visualDets", "Perceptual details", term),
+    term = gsub("valenceCategorypos", "Positive valence", term),
+    term = gsub("valenceCategoryneg", "Negative valence", term),
+    term = gsub(":", " × ", term)
+  ) %>%
+  
+  # --- Split ROI ---
+  separate(ROI, into = c("Hemisphere", "Network", "Region label"), sep = "_", extra = "merge") %>%
+  
+  # Move Hemisphere last and rename
+  select(term, Network, `Region label`, Hemi = Hemisphere, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # --- Filter only Default networks ---
+  filter(Network %in% c("DefaultA", "DefaultB", "DefaultC")) %>%
+  
+  # Sort: main effects first, then interactions
+  mutate(is_interaction = grepl("×", term)) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  
+  # Label term only once per group
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup() %>%
+  
+  # --- Recode p-values ---
+  mutate(
+    Pr.fdr = case_when(
+      Pr.fdr < 0.001 ~ "p < .001",
+      Pr.fdr < 0.01  ~ "p < .01",
+      Pr.fdr < 0.05  ~ "p < .05",
+      TRUE           ~ as.character(signif(Pr.fdr, 3))
+    )
+  )
+
+# --- Print filtered table ---
+kable(
+  df_clean[, c("term_label", "Network", "Region label", "Hemi", "Estimate", "df", "t.value", "Pr.fdr")],
+  col.names = c("Term", "Network", "Region label", "Hemi", "Estimate", "df", "t", "p (FDR)"),
+  digits = 3,
+  format = "simple"
+)
+
+
+# make a data frame version of clean table
+table_for_word <- df_clean %>%
+  select(Term = term_label,
+         Network,
+         `Region label`,
+         Hemi,
+         Estimate,
+         df,
+         t = t.value,
+         `p (FDR)` = Pr.fdr)
+
+# create a flextable
+ft <- flextable(table_for_word)
+ft <- autofit(ft)
+
+# export to Word
+doc <- read_docx() |>
+  body_add_flextable(ft)
+print(doc, target = "regression_table_DMN.docx")
+
+```
+
+
+# Within vs between parcels 
+##  Within vs Between t-test 
+
+
+```{r}
+
+# Assign network labels to ROIs
+roi.data.sim <- roi.data %>%
+  mutate(network = case_when(
+    grepl("DefaultA", ROI) ~ "DMN A",
+    grepl("DefaultB", ROI) ~ "DMN B",
+    grepl("DefaultC", ROI) ~ "DMN C",
+    TRUE ~ "Other"
+  ))
+
+# Pivot to wide format: rows = trials, columns = ROIs
+roi_matrix <- roi.data.sim %>%
+  select(subID, trial, ROI, regulationActivity) %>%
+  pivot_wider(names_from = ROI, values_from = regulationActivity)
+
+roi_names <- sort(unique(roi.data.sim$ROI))
+message("Number of canonical ROIs: ", length(roi_names))
+
+
+#COMPUTE ROI-ROI CORRELATIONS BY SUBJECT
+
+subs <- split(roi_matrix, roi_matrix$subID)
+
+roi_corrs_list <- lapply(names(subs), function(sid) {
+  df <- subs[[sid]]
+  roi_cols <- intersect(colnames(df), roi_names)
+  
+  if (length(roi_cols) < 2) return(NULL)
+  
+  mat <- df[, roi_cols, drop = FALSE]
+  
+  # Remove all-NA columns
+  all_na_cols <- which(vapply(mat, function(x) all(is.na(x)), logical(1)))
+  if (length(all_na_cols) > 0) {
+    mat <- mat[, -all_na_cols, drop = FALSE]
+  }
+  
+  if (ncol(mat) < 2 || nrow(mat) < 2) return(NULL)
+  
+  # Compute correlation matrix
+  corr <- cor(mat, use = "pairwise.complete.obs")
+  
+  tibble(
+    subID = sid,
+    ROI1 = rep(colnames(corr), each = ncol(corr)),
+    ROI2 = rep(colnames(corr), times = ncol(corr)),
+    corr = as.vector(corr)
+  )
+})
+
+roi_corrs <- bind_rows(roi_corrs_list)
+cat("Subjects processed:", length(roi_corrs_list), "\n")
+
+
+# ADD NETWORK LABELS AND FILTER
+
+roi_corrs <- roi_corrs %>%
+  # Add network labels for both ROIs
+  left_join(
+    roi.data.sim %>% distinct(ROI, network),
+    by = c("ROI1" = "ROI")
+  ) %>%
+  rename(net1 = network) %>%
+  left_join(
+    roi.data.sim %>% distinct(ROI, network),
+    by = c("ROI2" = "ROI")
+  ) %>%
+  rename(net2 = network) %>%
+  # Keep only DMN pairs
+  filter(net1 != "Other", net2 != "Other") %>%
+  # Remove self-correlations
+  filter(ROI1 != ROI2) %>%
+  # Keep each unique pair only once
+  filter(ROI1 < ROI2) %>%
+  # Define within vs between
+  mutate(
+    pair_type = ifelse(net1 == net2, "within", "between"),
+    # Fisher z-transform
+    z_corr = atanh(corr)
+  )
+
+cat("Total ROI pairs:", nrow(roi_corrs), "\n")
+
+
+# DIAGNOSTIC CHECKS
+cat("\n=== DIAGNOSTIC CHECKS ===\n")
+
+# 1. Network assignments
+cat("\n1. Network assignment:\n")
+roi.data.sim %>% 
+  distinct(ROI, network) %>% 
+  count(network) %>%
+  print()
+
+# 2. Pair type breakdown
+cat("\n2. Correlation pairs by type:\n")
+roi_corrs %>% 
+  count(pair_type) %>%
+  print()
+
+# 3. Check each subject has both types
+cat("\n3. Subject-level pair availability:\n")
+subject_check <- roi_corrs %>%
+  group_by(subID) %>%
+  summarise(
+    has_within = any(pair_type == "within"),
+    has_between = any(pair_type == "between"),
+    n_within = sum(pair_type == "within"),
+    n_between = sum(pair_type == "between")
+  )
+
+cat("Subjects with BOTH within and between pairs:", 
+    sum(subject_check$has_within & subject_check$has_between), "\n")
+cat("Subjects with ONLY within pairs:", 
+    sum(subject_check$has_within & !subject_check$has_between), "\n")
+cat("Subjects with ONLY between pairs:", 
+    sum(!subject_check$has_within & subject_check$has_between), "\n")
+
+# 4. Distribution check
+cat("\n4. Correlation distributions:\n")
+roi_corrs %>% 
+  group_by(pair_type) %>%
+  summarise(
+    n_pairs = n(),
+    n_subjects = n_distinct(subID),
+    mean_r = mean(corr, na.rm = TRUE),
+    sd_r = sd(corr, na.rm = TRUE),
+    mean_z = mean(z_corr, na.rm = TRUE),
+    sd_z = sd(z_corr, na.rm = TRUE)
+  ) %>%
+  print()
+
+
+# SUBJECT-LEVEL AGGREGATION FOR T-TEST
+
+
+# Average Fisher z-transformed correlations within each subject and pair type
+subject_avg <- roi_corrs %>%
+  group_by(subID, pair_type) %>%
+  summarise(
+    mean_z = mean(z_corr, na.rm = TRUE),
+    n_pairs = n(),
+    .groups = "drop"
+  )
+
+# Pivot to wide format for paired t-test
+subject_wide <- subject_avg %>%
+  pivot_wider(
+    id_cols = subID,
+    names_from = pair_type,
+    values_from = mean_z
+  )
+
+cat("\n=== SUBJECT-LEVEL DATA FOR T-TEST ===\n")
+cat("Subjects with complete data (both within and between):", 
+    sum(!is.na(subject_wide$within) & !is.na(subject_wide$between)), "\n")
+cat("Subjects missing within data:", sum(is.na(subject_wide$within)), "\n")
+cat("Subjects missing between data:", sum(is.na(subject_wide$between)), "\n")
+
+
+# PAIRED T-TEST: WITHIN vs BETWEEN
+
+cat("\n=== PAIRED T-TEST RESULTS ===\n")
+
+# Remove subjects with missing data in either condition
+subject_complete <- subject_wide %>%
+  filter(!is.na(within) & !is.na(between))
+
+cat("N subjects in analysis:", nrow(subject_complete), "\n\n")
+
+# Descriptive statistics
+cat("Descriptive statistics (Fisher z):\n")
+cat("Within-network:  M =", round(mean(subject_complete$within), 3), 
+    ", SD =", round(sd(subject_complete$within), 3), "\n")
+cat("Between-network: M =", round(mean(subject_complete$between), 3), 
+    ", SD =", round(sd(subject_complete$between), 3), "\n")
+cat("Difference:      M =", round(mean(subject_complete$within - subject_complete$between), 3), 
+    ", SD =", round(sd(subject_complete$within - subject_complete$between), 3), "\n\n")
+
+# Convert back to r for interpretation
+cat("Descriptive statistics (Pearson r):\n")
+cat("Within-network:  M =", round(tanh(mean(subject_complete$within)), 3), "\n")
+cat("Between-network: M =", round(tanh(mean(subject_complete$between)), 3), "\n\n")
+
+# Paired t-test
+ttest_result <- t.test(
+  subject_complete$within, 
+  subject_complete$between, 
+  paired = TRUE,
+  alternative = "two.sided"
+)
+
+print(ttest_result)
+
+# Effect size (Cohen's d for paired samples)
+diff <- subject_complete$within - subject_complete$between
+cohens_d <- mean(diff) / sd(diff)
+cat("\nCohen's d =", round(cohens_d, 3), "\n")
+
+
+# 6. SAVE SUBJECT-LEVEL SUMMARY
+
+# Add difference score for plotting
+subject_summary <- subject_complete %>%
+  mutate(
+    difference = within - between,
+    within_r = tanh(within),
+    between_r = tanh(between)
+  )
+
+cat("Variables preserved for later use:\n")
+cat("- roi.data.sim: original data with network labels\n")
+cat("- roi_corrs: all pairwise correlations with network info\n")
+cat("- subject_summary: subject-level averages for plotting\n")
+```
+
+## (Extended Data Figure 2-1a) plot 
+
+```{r}
+plot_df <- subject_summary %>%
+  select(subID, within, between) %>%
+  pivot_longer(
+    cols = c(within, between),
+    names_to = "pair_type",
+    values_to = "mean_z"
+  )
+```
+
+```{r}
+wb_box = ggplot(plot_df, aes(x = pair_type, y = mean_z, fill = pair_type)) +
+
+  # paired lines
+  geom_line(aes(group = subID),
+            color = "gray70",
+            alpha = 0.4) +
+
+  # points
+  geom_point(aes(color = pair_type),
+             size = 2,
+             alpha = 0.7,
+             position = position_jitter(width = 0.05)) +
+
+  # boxplots
+  geom_boxplot(width = 0.4,
+               outlier.shape = NA,
+               alpha = 0.6) +
+
+  scale_fill_manual(values = c(
+    "within" = "#F4E6A2",     # light soft yellow
+    "between" = "#7FCBD4"    # aesthetic cyan
+  )) +
+
+  scale_color_manual(values = c(
+    "within" = "#C9B458",    # slightly darker yellow for points
+    "between" = "#3FA7B3"
+  )) +
+
+  scale_x_discrete(labels = c(
+    "within" = "Within",
+    "between" = "Between"
+  )) +
+
+  scale_y_continuous(limits = c(0, NA)) +   # start y-axis at zero
+
+  theme_classic(base_size = 12) +
+
+  labs(
+    x = NULL,
+    y = "Mean parcel-parcel correlation (Fisher z)"
+  ) +
+
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  )
+
+wb_box
+
+
+# UNCOMMENT + INSERT PATH to export 
+# ggsave(filename = 'insert-path',
+#        plot = wb_box,
+#        device = "png",
+#        dpi = 300,
+#        width = 3.5,
+#        height = 4,
+#        units = "in")
+```
+
+## (Extended Data FIgure 2-1b) corr matrix 
+
+```{r}
+
+# create ROI name lookup (no "Other" network)
+roi_name_lookup <- roi.data.sim %>%
+  distinct(ROI, network) %>%
+  filter(network != "Other")
+
+# calculate group-level correlations from roi_corrs
+roi_corrs_group <- roi_corrs %>%
+  filter(net1 != "Other", net2 != "Other") %>%
+  group_by(ROI1, ROI2, net1, net2) %>%
+  summarise(mean_z = mean(z_corr, na.rm = TRUE), .groups = "drop")
+
+# mirror the matrix to fill both triangles
+roi_corrs_mirror <- roi_corrs_group %>%
+  rename(ROI1_temp = ROI1, ROI2_temp = ROI2,
+         net1_temp = net1, net2_temp = net2) %>%
+  rename(ROI1 = ROI2_temp, ROI2 = ROI1_temp,
+         net1 = net2_temp, net2 = net1_temp)
+
+# add diagonal with NA so that it is gray 
+all_dmn_rois <- roi_name_lookup$ROI
+roi_corrs_diagonal <- tibble(
+  ROI1 = all_dmn_rois,
+  ROI2 = all_dmn_rois,
+  net1 = roi_name_lookup$network,
+  net2 = roi_name_lookup$network,
+  mean_z = NA_real_  # NA for diagonal - will be gray
+)
+
+# combine all
+roi_corrs_full <- bind_rows(roi_corrs_group, roi_corrs_mirror, roi_corrs_diagonal)
+
+# create shortened names
+roi_corrs_full <- roi_corrs_full %>%
+  mutate(
+    ROI1_short = str_replace(ROI1, "Default", ""),
+    ROI2_short = str_replace(ROI2, "Default", "")
+  )
+
+# order ROIs by network 
+roi_order_short <- roi_name_lookup %>%
+  mutate(ROI_short = str_replace(ROI, "Default", "")) %>%
+  arrange(factor(network, levels = c("DMN A", "DMN B", "DMN C"))) %>%
+  pull(ROI_short)
+
+# apply factor ordering
+roi_corrs_full$ROI1_short <- factor(roi_corrs_full$ROI1_short, levels = roi_order_short)
+roi_corrs_full$ROI2_short <- factor(roi_corrs_full$ROI2_short, levels = roi_order_short)
+
+# calculate network boundaries
+network_boundaries <- roi_name_lookup %>%
+  mutate(network_label = recode(network,
+                                "DMN A" = "Core",
+                                "DMN B" = "DM",
+                                "DMN C" = "MT")) %>%
+  arrange(factor(network, levels = c("DMN A", "DMN B", "DMN C"))) %>%
+  group_by(network_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(
+    cum_n = cumsum(n),
+    start = cum_n - n + 1,
+    mid = start + (n - 1) / 2
+  )
+
+boundary_lines <- network_boundaries$cum_n[-nrow(network_boundaries)] + 0.5
+
+# create correlation matrix plot
+correlation_matrix <- ggplot(roi_corrs_full, aes(x = ROI1_short, y = ROI2_short, fill = mean_z)) +
+  geom_tile(color = NA) +
+  scale_fill_gradient2(
+    low = "#3B4CC0",
+    mid = "white",
+    high = "#B40426",
+    midpoint = 0,
+    name = "Correlation\n(Fisher Z)",
+    na.value = "grey90"  # Gray diagonal
+  ) +
+  geom_hline(yintercept = boundary_lines, color = "black", linewidth = 0.3) +
+  geom_vline(xintercept = boundary_lines, color = "black", linewidth = 0.3) +
+  annotate("text", 
+           x = network_boundaries$mid, 
+           y = length(roi_order_short) + 3,
+           label = network_boundaries$network_label, 
+           size = 4, 
+           fontface = "bold") +
+  annotate("text", 
+           x = -1.5,
+           y = network_boundaries$mid,
+           label = network_boundaries$network_label, 
+           angle = 90, 
+           size = 4, 
+           fontface = "bold") +
+  labs(x = NULL, y = NULL) +
+  theme_classic(base_size = 10) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.ticks.length = unit(0.05, "cm"),
+    axis.line = element_blank(),
+    panel.border = element_blank(),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.key.height = unit(0.6, "cm"),
+    legend.key.width = unit(0.25, "cm"),
+    plot.margin = margin(30, 10, 10, 30)
+  ) +
+  coord_fixed(expand = FALSE, clip = "off")
+
+correlation_matrix
+
+# UNCOMMENT + INSERT PATH to export 
+# ggsave(filename = 'insert-path',
+#        plot = correlation_matrix,
+#        device = "png",
+#        dpi = 300,
+#        width = 4,
+#        height = 3.5,
+#        units = "in")
+```
+
+
+# Plot whole brains  (possibly add t code from earlier)
+
+
+## setup 
+
+create plot_brain helper function for plotting brains 
+```{r}
+library(ggseg)
+library(ggsegSchaefer)
+library(patchwork) 
+
+# Load the Schaefer atlas 
+atlas <- as_tibble(schaefer17_200)  # 17 networks, 200 cortical parcels
+
+# Function to plot brain results
+plot_brain <- function(atlas_data, side, symmetric = TRUE, threshold = FALSE) {
+  
+  # Find min and max values for color scale
+  minval <- min(atlas_data$t_value, na.rm = TRUE)
+  maxval <- max(atlas_data$t_value, na.rm = TRUE)
+  
+  # Make scale symmetric if needed
+  if (symmetric) {
+    if (abs(minval) > abs(maxval) & minval < 0 & maxval > 0) {
+      maxval <- -1 * minval
+    }
+    if (abs(maxval) > abs(minval) & minval < 0 & maxval > 0) {
+      minval <- -1 * maxval
+    }
+  }
+  
+  # Threshold non-significant values
+  if (threshold) {
+    atlas_data$t_value[atlas_data$sig == FALSE] <- NA
+  }
+  
+  # Set NA sig to FALSE
+  atlas_data$sig[is.na(atlas_data$sig)] <- FALSE
+  
+  # Create the plot 
+  p <- ggplot() + 
+    geom_brain(
+      atlas = atlas_data,
+      mapping = aes(fill = t_value, color=sig),
+      position = position_brain(position = 'horizontal'),
+      hemi = side,
+      size = .5,
+      show.legend = FALSE
+    ) +
+    theme_void() +
+    scale_fill_gradient2(
+      limits = c(minval, maxval),
+      na.value = "grey80",
+      low = "#2166ac",
+      mid = "white",
+      high = "#b2182b",
+      midpoint = 0
+    ) + 
+    scale_colour_manual(values = c("TRUE" = "black", "FALSE" = NA), guide = "none")
+
+  
+  return(p)
+}
+```
+
+
+define t-plot function, needed for supplement plots 
+
+```{r}
+
+# Purpose: Creates t-value scatter plot for DMN ROIs only
+make_effect_plot_pub_univariate <- function(model_df, title = NULL) {
+  
+  # Relabel networks to match publication style
+  plot_data <- model_df %>%
+    mutate(
+      network = case_when(
+        grepl("DefaultA", ROI) ~ "Core midline",
+        grepl("DefaultB", ROI) ~ "Dorsomedial",
+        grepl("DefaultC", ROI) ~ "Medial temporal",
+        TRUE ~ "Other"
+      ),
+      ROI_clean = case_when(
+        grepl("HIPP", ROI) ~ ROI,
+        grepl("AMYG", ROI) ~ ROI,
+        TRUE ~ ROI %>%
+          gsub("^LH_|^RH_", "", .) %>%
+          gsub("DefaultA_|DefaultB_|DefaultC_", "", .)
+      )
+    ) %>%
+    filter(network != "Other")
+  
+  # Create plot with consistent formatting
+  p <- ggplot(plot_data, aes(x = network, y = t.value)) +
+    geom_point(
+      aes(color = network, fill = ifelse(sig, network, "white")),
+      shape = 21, size = 2, stroke = 0.8
+    ) +
+    geom_text(
+      aes(label = ROI_clean, color = network),
+      hjust = 0, vjust = 0.5, nudge_x = 0.05, size = 2.5
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray", size = 0.5) + 
+    scale_fill_manual(
+      values = c("white" = "white", 
+                 "Core midline" = "slateblue1", 
+                 "Dorsomedial" = "lightsteelblue3", 
+                 "Medial temporal" = "slateblue4")
+    ) +
+    scale_color_manual(
+      values = c("Core midline" = "slateblue1", 
+                 "Dorsomedial" = "lightsteelblue3", 
+                 "Medial temporal" = "slateblue4")
+    ) +
+    labs(x = NULL, y = "Activity (t-value)") +
+    theme_classic(base_size = 10) +
+    theme(
+      legend.position = "none",
+      axis.line.x = element_line(color = "black", size = 0.5), 
+      axis.line.y = element_line(color = "black", size = 0.5), 
+      axis.title.y = element_text(size = 10),
+      axis.text.y = element_text(size = 8), 
+      axis.text.x = element_text(size = 8),
+      plot.title = element_blank(),
+      axis.ticks = element_line(color = "black", size = 0.5),
+      axis.ticks.length = unit(0.1, "cm")
+    )
+  
+  # Add title only if provided
+  if (!is.null(title)) {
+    p <- p + labs(title = title) +
+      theme(plot.title = element_text(hjust = 0.5, size = 10))
+  }
+  
+  return(p)
+}
+```
+
+
+## Figure 2b (brain plots)
+
+```{r}
+# create plot without a legend 
+create_left_brain_no_legend <- function(model_data) {
+  
+  # Prepare brain data
+  atlas <- as_tibble(schaefer17_200)
+  
+  plotvals <- model_data %>%
+    filter(!ROI %in% c("LH_HIPP", "RH_HIPP", "LH_AMYG", "RH_AMYG")) %>%
+    select(ROI, t_value = t.value, sig) %>%
+    mutate(region = paste0('17Networks_', ROI)) %>%
+    select(region, t_value, sig) %>%
+    distinct(region, .keep_all = TRUE)
+  
+  atlas_data <- left_join(atlas, plotvals, by = "region")
+  
+  # Get min/max for symmetric scale
+  minval <- min(atlas_data$t_value, na.rm = TRUE)
+  maxval <- max(atlas_data$t_value, na.rm = TRUE)
+  
+  if (abs(minval) > abs(maxval) & minval < 0 & maxval > 0) {
+    maxval <- -1 * minval
+  }
+  if (abs(maxval) > abs(minval) & minval < 0 & maxval > 0) {
+    minval <- -1 * maxval
+  }
+  
+  # Set NA sig to FALSE
+  atlas_data$sig[is.na(atlas_data$sig)] <- FALSE
+  
+  # Create left brain plot WITHOUT LEGEND
+  brain_plot <- ggplot() + 
+    geom_brain(
+      atlas = atlas_data,
+      mapping = aes(fill = t_value, color = sig),
+      position = position_brain(position = 'horizontal'),
+      hemi = "left",
+      size = 0.5,
+      show.legend = FALSE
+    ) +
+    theme_void() +
+    scale_fill_gradient2(
+      limits = c(minval, maxval),
+      na.value = "grey80",
+      low = "#2166ac",
+      mid = "white",
+      high = "#b2182b",
+      midpoint = 0
+    ) + 
+    scale_colour_manual(
+      values = c(`TRUE` = "black", `FALSE` = NA), 
+      guide = "none"
+    )
+  
+  return(brain_plot)
+  
+}
+  
+# create a legend 
+  create_standalone_legend <- function(minval = -4, maxval = 4) {
+  
+  # Create a dummy dataset for the legend
+  legend_data <- data.frame(
+    x = 1,
+    y = seq(minval, maxval, length.out = 100)
+  )
+  
+  legend_plot <- ggplot(legend_data, aes(x = x, y = y, fill = y)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#2166ac",
+      mid = "white",
+      high = "#b2182b",
+      midpoint = 0,
+      name = "t-value",
+      limits = c(minval, maxval)
+    ) +
+    theme_void(base_size = 10) +
+    theme(
+      legend.position = "right",
+      legend.key.height = unit(1.5, "cm"),
+      legend.key.width = unit(0.3, "cm"),
+      legend.title = element_text(size = 8, face = "bold"),
+      legend.text = element_text(size = 7),
+      plot.margin = margin(0, 0, 0, 0)
+    ) +
+    guides(fill = guide_colorbar(
+      title = "t-value",
+      title.position = "top",
+      title.hjust = 0.5
+    ))
+  
+  return(legend_plot)
+  }
+  
+  
+  
+  
+# Define which models to plot
+model_list <- list(
+  "Narrative details" = event.model,
+  "Perceptual details" = visual.model,
+  "Positive valence" = pos.model,
+  "Negative valence" = neg.model
+)
+
+# Set output directory - UNCOMMENT FOR EXPORT 
+# output_dir <- "SPECIFY IF EXPORTING PLOTS" 
+
+# Loop through all models and save LEFT BRAIN plots (NO LEGEND, NO CAPTION)
+for (model_name in names(model_list)) {
+  
+  cat("Creating left brain plot for:", model_name, "\n")
+  
+  # Create left brain plot
+  plot_obj <- create_left_brain_no_legend(model_list[[model_name]])
+  
+  # Create clean filename
+  filename <- gsub(" ", "_", tolower(model_name))
+  filepath <- file.path(output_dir, paste0(filename, '_left_brain_only_FOR_FIGURE_2.png'))
+  
+  # Save plot - 3 inches wide
+  ggsave(
+    filename = filepath,
+    plot = plot_obj,
+    device = "png",
+    dpi = 300,
+    width = 2.5,      # 3 inches across
+    height = 1.6,     # Adjust as needed
+    units = "in",
+    bg = "white"
+  )
+  
+  cat("Saved:", filepath, "\n\n")
+  
+  # Display plot
+  print(plot_obj)
+  
+  # Pause between saves
+  Sys.sleep(0.5)
+}
+
+# Create and save STANDALONE LEGEND (separate file)
+cat("Creating standalone legend...\n")
+legend_plot <- create_standalone_legend(minval = -4, maxval = 4)
+
+
+
+# UNCOMMENT AND CHANGE OUTPUT_DIR TO EXPORT PLOT 
+# ggsave(
+#   filename = file.path(output_dir, 'brain_legend_only.png'),
+#   plot = legend_plot,
+#   device = "png",
+#   dpi = 300,
+#   width = 0.8,    # Narrow - just the legend bar
+#   height = 2,     # 2 inches tall as requested
+#   units = "in",
+#   bg = "white"
+# )
+
+print(legend_plot)
+cat("Saved standalone legend!\n")
+  
+```
+
+
+## Extended Data Figure 2-2
+
+```{r}
+# Create individual scatter plots for each model
+p1 <- make_effect_plot_pub_univariate(event.model, title = "Narrative details")
+p2 <- make_effect_plot_pub_univariate(visual.model, title = "Perceptual details")
+p3 <- make_effect_plot_pub_univariate(pos.model, title = "Positive valence")
+p4 <- make_effect_plot_pub_univariate(neg.model, title = "Negative valence")
+
+# Combine into a 4-panel figure (2x2 grid)
+library(patchwork)
+
+four_panel_plot <- (p1 | p2) / (p3 | p4) 
+
+# Display
+print(four_panel_plot)
+
+
+# UNCOMMENT AND SPECIFY AN OUTPUT_DIR FOR EXPORT 
+# ggsave(
+#   filename = file.path(output_dir, 'univariate_four_panel_scatter_plots.png'),
+#   plot = four_panel_plot,
+#   device = "png",
+#   dpi = 300,
+#   width = 6,      # Wide enough for 2 columns
+#   height = 5,     # Tall enough for 2 rows
+#   units = "in",
+#   bg = "white"
+# )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

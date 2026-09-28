@@ -1,0 +1,1591 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+# Setup 
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(ez)
+library(ggsegSchaefer)
+library(ggseg3d)
+library(ggseg)
+library(sjPlot)
+library(kableExtra)
+library(corrplot)
+library(ggpubr)
+library(here)
+library(glue)
+library(officer)
+library(rvg)
+library(dplyr)
+```
+
+this uses alldata from univariate network analysis script 
+```{r}
+alldata = readRDS("alldata_reframe-detail.rds")
+```
+
+
+
+load template-recall rsa files 
+```{r}
+subjects <- list.files(path='/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/rsa-encret/',full.names=TRUE, recursive = TRUE, pattern = 'timepoint-rsa')
+rsadata  = do.call(rbind, lapply(subjects, function(x) {read.csv(x, header = TRUE)}))
+
+rsadata <- rsadata %>%
+  filter(ROI != "none")
+
+rsadata$ROI <- as.factor(rsadata$ROI)
+rsadata$videoName <- as.factor(rsadata$videoName)
+rsadata$periodLabel <- as.factor(rsadata$periodLabel)
+
+rsadata <- rsadata %>%
+  select(subID,trial,ROI,videoName,periodLabel,zWithin,zBetween,zDifference)
+```
+
+
+
+load recall-recall rsa files 
+```{r}
+subjects <- list.files(path='/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/retstab_rsa/',full.names=TRUE, recursive = TRUE, pattern = 'timepoint-rsa')
+rsadata.stability  = do.call(rbind, lapply(subjects, function(x) {read.csv(x, header = FALSE)}))
+
+colnames(rsadata.stability) = c("subID", "ROI", "trialID", "cueWord", "videoName", "run", "trial", "regulationImg", "regulationActivity", "reminderImg", "reminderActivity", "nVox", "periodLabel", "zWithin", "zBetween", "zDifference")
+
+rsadata.stability <- rsadata.stability %>%
+  filter(ROI != "none")
+
+rsadata.stability$ROI <- as.factor(rsadata.stability$ROI)
+rsadata.stability$videoName <- as.factor(rsadata.stability$videoName)
+rsadata.stability$periodLabel <- as.factor(rsadata.stability$periodLabel)
+
+rsadata.stability <- rsadata.stability %>%
+  mutate(zWithin.stab = zWithin,
+         zBetween.stab = zBetween,
+         zDifference.stab = zDifference) %>%
+  select(subID,trial,ROI,videoName,periodLabel,zWithin.stab,zBetween.stab,zDifference.stab)
+```
+
+
+combine with trial info 
+```{r}
+rsadata <- left_join(rsadata,alldata,by=c("subID","trial","ROI","videoName","periodLabel")) 
+rsadata <- left_join(rsadata,rsadata.stability,by=c("subID","trial","ROI","videoName","periodLabel"))
+rsadata <- rsadata %>% filter(!is.na(eventDets))
+rm(rsadata.stability)
+```
+
+Ensuring we are only using remembered trials 
+```{r}
+rsadata =rsadata %>% filter(remembered==1,conditionName == "remember")
+```
+
+
+setup for analysis 
+```{r}
+rois <- levels(alldata$ROI)
+outDir <- '/Volumes/memolab/Data/Behavioral_Online/reframe-details/detail_script_files/reframe-detail_rsa_wholebrain/'
+alphafdr <- .05
+```
+
+
+summarising by ROI, not network 
+```{r}
+rsadata %>%
+ # filter(network %in% include_networks) %>% # this limits everything to only the 3 DMN subnetworks. 
+  group_by(subID, trial, ROI, eventDets, visualDets, correctDetails, valenceCategory, regSuccess) %>%
+  summarize(zDifference = mean(zDifference,na.rm=TRUE), 
+            zDifference.stab = mean(zDifference.stab,na.rm=TRUE)) %>%
+  ungroup() -> roi.rsa.data
+```
+
+
+# Analysis: template-recall RSA
+setting up model function 
+```{r}
+detail_emo_neuref <- function(curROI, model.stats.wbrsa) {
+
+  # subset data for this ROI
+  roiData <- roi.rsa.data %>% filter(as.character(ROI) == curROI)
+  
+  # skip if there’s no data 
+  if (nrow(roiData) == 0) {
+    message("Skipping ROI: ", curROI, " (no data)")
+    return(model.stats.wbrsa)  # just return the existing stats
+  }
+  
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  
+  # fit model
+  full.model <- lmer(zDifference ~ visualDets + eventDets +
+                       visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  
+  # extract stats
+  stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats, ROI=curROI)
+  model.stats.wbrsa <- rbind(model.stats.wbrsa, stats)
+  
+  return(model.stats.wbrsa)
+}
+
+
+```
+
+
+loop over all ROIs to run the model: 
+
+```{r}
+
+model.stats.wbrsa <- data.frame(
+  term = character(),
+  estimate = numeric(),
+  std.error = numeric(),
+  statistic = numeric(),
+  p.value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+rois <- levels(alldata$ROI)   # all ROIs in your dataset
+
+for (r in rois) {
+  model.stats.wbrsa <- detail_emo_neuref(r, model.stats.wbrsa)
+}
+
+# move the row names of model.stats into a proper column - causing errors if you don't
+if (is.null(model.stats.wbrsa$term)) {
+  model.stats.wbrsa <- model.stats.wbrsa %>%
+    tibble::rownames_to_column(var = "term")
+}
+
+
+```
+
+```{r}
+# Select all eventDets rows
+event.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^eventDets[0-9]*$", term))   # ^ matches "eventDets", "eventDets1", ..., "eventDets41"
+
+
+# FDR correction
+p.values <- event.model.wbrsa[,6] # p-value column is in column 6
+event.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.model.wbrsa <- event.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# display table below 
+kbl(event.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+
+```{r}
+# Select all visualDets rows, including numbered ones up to visualDets41
+visual.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^visualDets[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- visual.model.wbrsa[,6]  
+visual.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.model.wbrsa <- visual.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(visual.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+pos.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- pos.model.wbrsa[,6]  
+pos.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+pos.model.wbrsa <- pos.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(pos.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+```{r}
+neg.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- neg.model.wbrsa[,6]  
+neg.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+neg.model.wbrsa <- neg.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(neg.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+```
+
+
+```{r}
+vis.pos.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^visualDets:valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- vis.pos.model.wbrsa[,6]  
+vis.pos.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+vis.pos.model.wbrsa <- vis.pos.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(vis.pos.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+```{r}
+vis.neg.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^visualDets:valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- vis.neg.model.wbrsa[,6]  
+vis.neg.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+vis.neg.model.wbrsa <- vis.neg.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(vis.neg.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+event.pos.model.wbrsa <- model.stats.wbrsa %>%
+   filter(grepl("^eventDets:valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- event.pos.model.wbrsa[,6]  
+event.pos.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.pos.model.wbrsa <- event.pos.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(event.pos.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+event.neg.model.wbrsa <- model.stats.wbrsa %>%
+  filter(grepl("^eventDets:valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- event.neg.model.wbrsa[,6]  
+event.neg.model.wbrsa$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neg.model.wbrsa <- event.neg.model.wbrsa %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(event.neg.model.wbrsa, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+# Combine all post-FDR data frames
+all_models <- bind_rows(
+  event.model.wbrsa,
+  visual.model.wbrsa,
+  pos.model.wbrsa,
+  neg.model.wbrsa,
+  event.pos.model.wbrsa,
+  event.neg.model.wbrsa,
+  vis.pos.model.wbrsa,
+  vis.neg.model.wbrsa,
+  .id = "model_name"  # optional, keeps track of which model each row came from
+)
+
+# Filter to only significant results
+sig_results <- all_models %>%
+  filter(sig == TRUE) %>%
+  arrange(model_name)  # optional: sort by FDR-corrected p-value
+
+# Display nicely
+kbl(sig_results, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+
+```
+
+make table 
+```{r}
+# Combine all post-FDR data frames with proper labels 
+all_models <- bind_rows(
+  event.model.wbrsa %>% mutate(model_name = "Narrative details"),
+  visual.model.wbrsa %>% mutate(model_name = "Perceptual details"),
+  pos.model.wbrsa %>% mutate(model_name = "Positive valence"),
+  neg.model.wbrsa %>% mutate(model_name = "Negative valence"),
+  event.pos.model.wbrsa %>% mutate(model_name = "Narrative details × Positive valence"),
+  event.neg.model.wbrsa %>% mutate(model_name = "Narrative details × Negative valence"),
+  vis.pos.model.wbrsa %>% mutate(model_name = "Perceptual details × Positive valence"),
+  vis.neg.model.wbrsa %>% mutate(model_name = "Perceptual details × Negative valence")
+)
+
+# Filter to only significant results
+sig_results <- all_models %>%
+  filter(sig == TRUE) %>%
+  arrange(model_name, ROI)
+
+# Display nicely
+kbl(sig_results, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+# --- Clean and format for display ---
+rsa_table_clean <- sig_results %>%
+  select(model_name, ROI, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # Round numeric columns
+  mutate(across(where(is.numeric), ~ signif(., 3))) %>%
+  
+  # --- Split ROI into components ---
+  separate(ROI, into = c("Hemisphere", "Network", "Region label"), sep = "_", extra = "merge") %>%
+  select(term = model_name, Network, `Region label`, Hemi = Hemisphere, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # --- Sort and group for readability ---
+  mutate(is_interaction = grepl("×", term)) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup() %>%
+  
+  # --- Format p-values ---
+  mutate(
+    Pr.fdr = case_when(
+      Pr.fdr < 0.001 ~ "p < .001",
+      Pr.fdr < 0.01  ~ "p < .01",
+      Pr.fdr < 0.05  ~ "p < .05",
+      TRUE           ~ as.character(signif(Pr.fdr, 3))
+    )
+  )
+
+# --- Display in console (simple kable version) ---
+kable(
+  rsa_table_clean[, c("term_label", "Network", "Region label", "Hemi", "Estimate", "df", "t.value", "Pr.fdr")],
+  col.names = c("Term", "Network", "Region label", "Hemi", "Estimate", "df", "t", "p (FDR)"),
+  digits = 3,
+  format = "simple"
+)
+
+# --- Export to Word (nice formatted table) ---
+table_for_word <- rsa_table_clean %>%
+  select(
+    Term = term_label,
+    Network,
+    `Region label`,
+    Hemi,
+    Estimate,
+    df,
+    t = t.value,
+    `p (FDR)` = Pr.fdr
+  )
+
+ft <- flextable(table_for_word) %>%
+  autofit() %>%
+  theme_vanilla() %>%
+  align(j = c("Estimate", "df", "t", "p (FDR)"), align = "center", part = "all")
+
+doc <- read_docx() |> 
+  body_add_par("RSA Results: Whole Brain", style = "heading 1") |> 
+  body_add_flextable(ft)
+
+print(doc, target = "RSA_results_table_encret.docx")
+
+# --- Optional: restrict to DMN only ---
+rsa_table_dmn <- rsa_table_clean %>%
+  filter(Network %in% c("DefaultA", "DefaultB", "DefaultC")) %>%
+  # Re-create term_label after filtering
+  select(-term_label) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup()
+
+ft_dmn <- flextable(rsa_table_dmn %>%
+  select(Term = term_label, Network, `Region label`, Hemi, Estimate, df, t = t.value, `p (FDR)` = Pr.fdr)) %>%
+  autofit()
+
+doc_dmn <- read_docx() |> 
+  body_add_par("RSA Results: DMN Only", style = "heading 1") |> 
+  body_add_flextable(ft_dmn)
+
+print(doc_dmn, target = "RSA_results_table_DMN_encret.docx")
+```
+
+
+### Extended Data Figure 4-1 (template-recall t-values)
+setup t-value plotting 
+```{r}
+# Define network colors
+network_colors <- c(
+  "DMN A" = "slateblue1", 
+  "DMN B" = "lightsteelblue3", 
+  "DMN C" = "slateblue4"
+)
+
+
+# Purpose: Creates t-value scatter plot for DMN ROIs only
+make_effect_plot_pub <- function(model_df, title = NULL) {
+  
+  # Relabel networks to match publication style
+  plot_data <- model_df %>%
+    mutate(
+      network = case_when(
+        grepl("DefaultA", ROI) ~ "Core midline",
+        grepl("DefaultB", ROI) ~ "Dorsomedial",
+        grepl("DefaultC", ROI) ~ "Medial temporal",
+        TRUE ~ "Other"
+      ),
+      ROI_clean = case_when(
+        grepl("HIPP", ROI) ~ ROI,
+        grepl("AMYG", ROI) ~ ROI,
+        TRUE ~ ROI %>%
+          gsub("^LH_|^RH_", "", .) %>%
+          gsub("DefaultA_|DefaultB_|DefaultC_", "", .)
+      )
+    ) %>%
+    filter(network != "Other")
+  
+  # Create plot with consistent formatting
+  p <- ggplot(plot_data, aes(x = network, y = t.value)) +
+    geom_point(
+      aes(color = network, fill = ifelse(sig, network, "white")),
+      shape = 21, size = 2, stroke = 0.8
+    ) +
+    geom_text(
+      aes(label = ROI_clean, color = network),
+      hjust = 0, vjust = 0.5, nudge_x = 0.05, size = 2.5
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray", size = 0.5) + 
+    scale_fill_manual(
+      values = c("white" = "white", 
+                 "Core midline" = "slateblue1", 
+                 "Dorsomedial" = "lightsteelblue3", 
+                 "Medial temporal" = "slateblue4")
+    ) +
+    scale_color_manual(
+      values = c("Core midline" = "slateblue1", 
+                 "Dorsomedial" = "lightsteelblue3", 
+                 "Medial temporal" = "slateblue4")
+    ) +
+    labs(x = NULL, y = "Template-recall similarity (t-value)") +
+    theme_classic(base_size = 10) +
+    theme(
+      legend.position = "none",
+      axis.line.x = element_line(color = "black", size = 0.5), 
+      axis.line.y = element_line(color = "black", size = 0.5), 
+      axis.title.y = element_text(size = 10),
+      axis.text.y = element_text(size = 8), 
+      axis.text.x = element_text(size = 8),
+      plot.title = element_blank(),
+      axis.ticks = element_line(color = "black", size = 0.5),
+      axis.ticks.length = unit(0.1, "cm")
+    )
+  
+  # Add title only if provided
+  if (!is.null(title)) {
+    p <- p + labs(title = title) +
+      theme(plot.title = element_text(hjust = 0.5, size = 10))
+  }
+  
+  return(p)
+}
+
+```
+
+
+```{r}
+# Create individual scatter plots for each template-recall model
+p1_rsa <- make_effect_plot_pub(event.model.wbrsa, title = "Narrative details")
+p2_rsa <- make_effect_plot_pub(visual.model.wbrsa, title = "Perceptual details")
+p3_rsa <- make_effect_plot_pub(pos.model.wbrsa, title = "Positive valence")
+p4_rsa <- make_effect_plot_pub(neg.model.wbrsa, title = "Negative valence")
+
+# Combine into a 4-panel figure (2x2 grid)
+library(patchwork)
+
+four_panel_plot_rsa <- (p1_rsa | p2_rsa) / (p3_rsa | p4_rsa)  
+
+# Display
+print(four_panel_plot_rsa)
+
+# Save - UNCOMMENT and DEFINE AN OUTPUT_DIR if exporting 
+# ggsave(
+#   filename = file.path(output_dir, 'template_recall_four_panel_scatter_plots.png'),
+#   plot = four_panel_plot_rsa,
+#   device = "png",
+#   dpi = 300,
+#   width = 6,      # Wide enough for 2 columns
+#   height = 5,     # Tall enough for 2 rows
+#   units = "in",
+#   bg = "white"
+# )
+```
+
+
+## Figure 4b: whole-brain template-recall
+
+```{r}
+# create plot without a legend 
+create_left_brain_no_legend <- function(model_data) {
+  
+  # Prepare brain data
+  atlas <- as_tibble(schaefer17_200)
+  
+  plotvals <- model_data %>%
+    filter(!ROI %in% c("LH_HIPP", "RH_HIPP", "LH_AMYG", "RH_AMYG")) %>%
+    select(ROI, t_value = t.value, sig) %>%
+    mutate(region = paste0('17Networks_', ROI)) %>%
+    select(region, t_value, sig) %>%
+    distinct(region, .keep_all = TRUE)
+  
+  atlas_data <- left_join(atlas, plotvals, by = "region")
+  
+  # Get min/max for symmetric scale
+  minval <- min(atlas_data$t_value, na.rm = TRUE)
+  maxval <- max(atlas_data$t_value, na.rm = TRUE)
+  
+  if (abs(minval) > abs(maxval) & minval < 0 & maxval > 0) {
+    maxval <- -1 * minval
+  }
+  if (abs(maxval) > abs(minval) & minval < 0 & maxval > 0) {
+    minval <- -1 * maxval
+  }
+  
+  # Set NA sig to FALSE
+  atlas_data$sig[is.na(atlas_data$sig)] <- FALSE
+  
+  # Create left brain plot WITHOUT LEGEND
+  brain_plot <- ggplot() + 
+    geom_brain(
+      atlas = atlas_data,
+      mapping = aes(fill = t_value, color = sig),
+      position = position_brain(position = 'horizontal'),
+      hemi = "left",
+      size = 0.5,
+      show.legend = FALSE
+    ) +
+    theme_void() +
+    scale_fill_gradient2(
+      limits = c(minval, maxval),
+      na.value = "grey80",
+      low = "#2166ac",
+      mid = "white",
+      high = "#b2182b",
+      midpoint = 0
+    ) + 
+    scale_colour_manual(
+      values = c(`TRUE` = "black", `FALSE` = NA), 
+      guide = "none"
+    )
+  
+  return(brain_plot)
+  
+}
+```
+
+```{r}
+# Load the Schaefer atlas
+atlas <- as_tibble(schaefer17_200)
+
+# Get all unique ROIs
+rois <- unique(roi.rsa.data$ROI)
+
+# Initialize results dataframe
+ttest.results <- data.frame(
+  ROI = character(),
+  t.value = numeric(),
+  df = numeric(),
+  p.value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each ROI and run t-test
+for (r in 1:length(rois)) {
+  
+  thisROI <- as.character(rois[r])
+  
+  # Calculate mean zDifference per subject for this ROI
+  roiData <- roi.rsa.data %>%
+    filter(ROI == thisROI) %>%
+    group_by(subID) %>%
+    summarize(meanZDiff = mean(zDifference, na.rm = TRUE))
+  
+  # Run t-test against zero
+  t.results <- t.test(roiData$meanZDiff, mu = 0)
+  
+  # Store results
+  ttest.results <- rbind(
+    ttest.results, 
+    data.frame(
+      ROI = thisROI,
+      t.value = t.results$statistic,
+      df = t.results$parameter,
+      p.value = t.results$p.value
+    )
+  )
+}
+
+# FDR correction
+ttest.results$Pr.fdr <- p.adjust(ttest.results$p.value, method = "fdr")
+ttest.results <- ttest.results %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display results summary
+cat("\nTemplate-Recall Reactivation: Number of significant ROIs:", sum(ttest.results$sig), "\n")
+print(ttest.results %>% filter(sig == TRUE))
+
+# Save results CSV
+write.csv(
+  ttest.results, 
+  file = file.path(output_dir, 'ttest_reactivation_template_recall_vs_zero.csv'),
+  row.names = FALSE
+)
+
+# Create LEFT BRAIN ONLY plot (no legend)
+cat("Creating left brain plot for template-recall reactivation...\n")
+reactivation_left_brain <- create_left_brain_no_legend(ttest.results)
+
+# # Save the brain plot
+# ggsave(filename = 'insert-path',
+#   plot = reactivation_left_brain,
+#   device = "png",
+#   dpi = 300,
+#   width = 3,
+#   height = 1.92,
+#   units = "in",
+#   bg = "white"
+# )
+
+print(reactivation_left_brain)
+```
+
+# Analysis: recall stability RSA 
+
+
+
+```{r}
+detail_emo_neuref <- function(curROI, model.stats.wbrsa.stab) {
+
+  # subset data for this ROI
+  roiData <- roi.rsa.data %>% filter(as.character(ROI) == curROI)
+  
+  # skip if there’s no data
+  if (nrow(roiData) == 0) {
+    message("Skipping ROI: ", curROI, " (no data)")
+    return(model.stats.wbrsa.stab)  # just return the existing stats
+  }
+  
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  
+  # fit model
+  full.model <- lmer(zDifference.stab ~ visualDets + eventDets +
+                       visualDets*valenceCategory + eventDets*valenceCategory +
+                       (1|subID), data = roiData)
+  
+  # extract stats
+  stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats, ROI=curROI)
+  model.stats.wbrsa.stab <- rbind(model.stats.wbrsa.stab, stats)
+  
+  return(model.stats.wbrsa.stab)
+}
+
+
+```
+
+
+loop over all ROIs to run the model: 
+
+```{r}
+
+model.stats.wbrsa.stab <- data.frame(
+  term = character(),
+  estimate = numeric(),
+  std.error = numeric(),
+  statistic = numeric(),
+  p.value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+rois <- levels(alldata$ROI)   # all ROIs in your dataset
+
+for (r in rois) {
+  model.stats.wbrsa.stab <- detail_emo_neuref(r, model.stats.wbrsa.stab)
+}
+
+# move the row names of model.stats into a proper column - causing errors if you don't
+if (is.null(model.stats.wbrsa.stab$term)) {
+  model.stats.wbrsa.stab <- model.stats.wbrsa.stab %>%
+    tibble::rownames_to_column(var = "term")
+}
+
+```
+
+```{r}
+# Select all eventDets rows
+event.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^eventDets[0-9]*$", term))   # ^ matches "eventDets", "eventDets1", ..., "eventDets41"
+
+
+# FDR correction
+p.values <- event.model.wbrsa.stab[,6] # p-value column is in column 6
+event.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.model.wbrsa.stab <- event.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# display table below 
+kbl(event.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+# Select all visualDets rows, including numbered ones up to visualDets41
+visual.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^visualDets[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- visual.model.wbrsa.stab[,6]  
+visual.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+visual.model.wbrsa.stab <- visual.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(visual.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+```
+
+
+
+```{r}
+pos.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- pos.model.wbrsa.stab[,6]  
+pos.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+pos.model.wbrsa.stab <- pos.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(pos.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+neg.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- neg.model.wbrsa.stab[,6]  
+neg.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+neg.model.wbrsa.stab <- neg.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(neg.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+
+```{r}
+vis.pos.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^visualDets:valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- vis.pos.model.wbrsa.stab[,6]  
+vis.pos.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+vis.pos.model.wbrsa.stab <- vis.pos.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(vis.pos.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+```{r}
+vis.neg.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^visualDets:valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- vis.neg.model.wbrsa.stab[,6]  
+vis.neg.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+vis.neg.model.wbrsa.stab <- vis.neg.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(vis.neg.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+```{r}
+event.pos.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+   filter(grepl("^eventDets:valenceCategorypos[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- event.pos.model.wbrsa.stab[,6]  
+event.pos.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.pos.model.wbrsa.stab <- event.pos.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(event.pos.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+```{r}
+event.neg.model.wbrsa.stab <- model.stats.wbrsa.stab %>%
+  filter(grepl("^eventDets:valenceCategoryneg[0-9]*$", term)) 
+
+
+# FDR correction
+p.values <- event.neg.model.wbrsa.stab[,6]  
+event.neg.model.wbrsa.stab$Pr.fdr <- p.adjust(p.values, method = "fdr")
+event.neg.model.wbrsa.stab <- event.neg.model.wbrsa.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display
+kbl(event.neg.model.wbrsa.stab, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+```
+
+```{r}
+# Combine all post-FDR data frames
+all_models <- bind_rows(
+  event.model.wbrsa.stab,
+  visual.model.wbrsa.stab,
+  pos.model.wbrsa.stab,
+  neg.model.wbrsa.stab,
+  event.pos.model.wbrsa.stab,
+  event.neg.model.wbrsa.stab,
+  vis.pos.model.wbrsa.stab,
+  vis.neg.model.wbrsa.stab,
+  .id = "model_name"  # optional, keeps track of which model each row came from
+)
+
+# Filter to only significant results
+sig_results <- all_models %>%
+  filter(sig == TRUE) %>%
+  arrange(model_name)  
+
+# Display nicely
+kbl(sig_results, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+```
+
+create table of sig. values 
+```{r}
+
+# Combine all post-FDR data frames WITH PROPER LABELS
+all_models <- bind_rows(
+  event.model.wbrsa.stab %>% mutate(model_name = "Narrative details"),
+  visual.model.wbrsa.stab %>% mutate(model_name = "Perceptual details"),
+  pos.model.wbrsa.stab %>% mutate(model_name = "Positive valence"),
+  neg.model.wbrsa.stab %>% mutate(model_name = "Negative valence"),
+  event.pos.model.wbrsa.stab %>% mutate(model_name = "Narrative details × Positive valence"),
+  event.neg.model.wbrsa.stab %>% mutate(model_name = "Narrative details × Negative valence"),
+  vis.pos.model.wbrsa.stab %>% mutate(model_name = "Perceptual details × Positive valence"),
+  vis.neg.model.wbrsa.stab %>% mutate(model_name = "Perceptual details × Negative valence")
+)
+
+# Filter to only significant results
+sig_results <- all_models %>%
+  filter(sig == TRUE) %>%
+  arrange(model_name, ROI)
+
+# Display nicely
+kbl(sig_results, digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "1200px", height = "800px")
+
+# --- Clean and format for display ---
+rsa_table_clean <- sig_results %>%
+  select(model_name, ROI, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # Round numeric columns
+  mutate(across(where(is.numeric), ~ signif(., 3))) %>%
+  
+  # --- Split ROI into components ---
+  separate(ROI, into = c("Hemisphere", "Network", "Region label"), sep = "_", extra = "merge") %>%
+  select(term = model_name, Network, `Region label`, Hemi = Hemisphere, Estimate, df, t.value, Pr.fdr) %>%
+  
+  # --- Sort and group for readability ---
+  mutate(is_interaction = grepl("×", term)) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup() %>%
+  
+  # --- Format p-values ---
+  mutate(
+    Pr.fdr = case_when(
+      Pr.fdr < 0.001 ~ "p < .001",
+      Pr.fdr < 0.01  ~ "p < .01",
+      Pr.fdr < 0.05  ~ "p < .05",
+      TRUE           ~ as.character(signif(Pr.fdr, 3))
+    )
+  )
+
+# --- Display in console (simple kable version) ---
+kable(
+  rsa_table_clean[, c("term_label", "Network", "Region label", "Hemi", "Estimate", "df", "t.value", "Pr.fdr")],
+  col.names = c("Term", "Network", "Region label", "Hemi", "Estimate", "df", "t", "p (FDR)"),
+  digits = 3,
+  format = "simple"
+)
+
+# --- Export to Word (nice formatted table) ---
+table_for_word <- rsa_table_clean %>%
+  select(
+    Term = term_label,
+    Network,
+    `Region label`,
+    Hemi,
+    Estimate,
+    df,
+    t = t.value,
+    `p (FDR)` = Pr.fdr
+  )
+
+ft <- flextable(table_for_word) %>%
+  autofit() %>%
+  theme_vanilla() %>%
+  align(j = c("Estimate", "df", "t", "p (FDR)"), align = "center", part = "all")
+
+doc <- read_docx() |> 
+  body_add_par("RSA Results: Significant Effects", style = "heading 1") |> 
+  body_add_flextable(ft)
+
+print(doc, target = "RSA_results_table_stab.docx")
+
+# --- Optional: restrict to DMN only ---
+rsa_table_dmn <- rsa_table_clean %>%
+  filter(Network %in% c("DefaultA", "DefaultB", "DefaultC")) %>%
+  # Re-create term_label after filtering
+  select(-term_label) %>%
+  arrange(is_interaction, term, Network, `Region label`, Hemi) %>%
+  group_by(term) %>%
+  mutate(term_label = ifelse(row_number() == 1, term, "")) %>%
+  ungroup()
+
+ft_dmn <- flextable(rsa_table_dmn %>%
+  select(Term = term_label, Network, `Region label`, Hemi, Estimate, df, t = t.value, `p (FDR)` = Pr.fdr)) %>%
+  autofit()
+
+doc_dmn <- read_docx() |> 
+  body_add_par("RSA Results: DMN Only", style = "heading 1") |> 
+  body_add_flextable(ft_dmn)
+
+print(doc_dmn, target = "RSA_results_table_DMN_stab.docx")
+```
+
+## Extended Data Figure 5-1 (recall stability t-values)
+
+
+setup 
+```{r}
+# Purpose: Creates t-value scatter plot for DMN ROIs only
+make_effect_plot_pub.stab <- function(model_df, title = NULL) {
+  
+  # Relabel networks to match publication style
+  plot_data <- model_df %>%
+    mutate(
+      network = case_when(
+        grepl("DefaultA", ROI) ~ "Core midline",
+        grepl("DefaultB", ROI) ~ "Dorsomedial",
+        grepl("DefaultC", ROI) ~ "Medial temporal",
+        TRUE ~ "Other"
+      ),
+      ROI_clean = case_when(
+        grepl("HIPP", ROI) ~ ROI,
+        grepl("AMYG", ROI) ~ ROI,
+        TRUE ~ ROI %>%
+          gsub("^LH_|^RH_", "", .) %>%
+          gsub("DefaultA_|DefaultB_|DefaultC_", "", .)
+      )
+    ) %>%
+    filter(network != "Other")
+  
+  # Create plot with consistent formatting
+  p <- ggplot(plot_data, aes(x = network, y = t.value)) +
+    geom_point(
+      aes(color = network, fill = ifelse(sig, network, "white")),
+      shape = 21, size = 2, stroke = 0.8
+    ) +
+    geom_text(
+      aes(label = ROI_clean, color = network),
+      hjust = 0, vjust = 0.5, nudge_x = 0.05, size = 2.5
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray", size = 0.5) + 
+    scale_fill_manual(
+      values = c("white" = "white", 
+                 "Core midline" = "slateblue1", 
+                 "Dorsomedial" = "lightsteelblue3", 
+                 "Medial temporal" = "slateblue4")
+    ) +
+    scale_color_manual(
+      values = c("Core midline" = "slateblue1", 
+                 "Dorsomedial" = "lightsteelblue3", 
+                 "Medial temporal" = "slateblue4")
+    ) +
+    labs(x = NULL, y = "Recall stability (t-value)") +
+    theme_classic(base_size = 10) +
+    theme(
+      legend.position = "none",
+      axis.line.x = element_line(color = "black", size = 0.5), 
+      axis.line.y = element_line(color = "black", size = 0.5), 
+      axis.title.y = element_text(size = 10),
+      axis.text.y = element_text(size = 8), 
+      axis.text.x = element_text(size = 8),
+      plot.title = element_blank(),
+      axis.ticks = element_line(color = "black", size = 0.5),
+      axis.ticks.length = unit(0.1, "cm")
+    )
+  
+  # Add title only if provided
+  if (!is.null(title)) {
+    p <- p + labs(title = title) +
+      theme(plot.title = element_text(hjust = 0.5, size = 10))
+  }
+  
+  return(p)
+}
+
+
+```
+
+
+```{r}
+# Create individual scatter plots for each stability model
+p1_stab <- make_effect_plot_pub.stab(event.model.wbrsa.stab, title = "Narrative details")
+p2_stab <- make_effect_plot_pub.stab(visual.model.wbrsa.stab, title = "Perceptual details")
+p3_stab <- make_effect_plot_pub.stab(pos.model.wbrsa.stab, title = "Positive valence")
+p4_stab <- make_effect_plot_pub.stab(neg.model.wbrsa.stab, title = "Negative valence")
+
+# Combine into a 4-panel figure (2x2 grid)
+library(patchwork)
+
+four_panel_plot_stab <- (p1_stab | p2_stab) / (p3_stab | p4_stab) 
+
+# Display
+print(four_panel_plot_stab)
+
+# # Save
+# ggsave(
+#   filename = file.path(output_dir, 'recall_stability_four_panel_scatter_plots.png'),
+#   plot = four_panel_plot_stab,
+#   device = "png",
+#   dpi = 300,
+#   width = 6,      # Wide enough for 2 columns
+#   height = 5,     # Tall enough for 2 rows
+#   units = "in",
+#   bg = "white"
+# )
+```
+
+
+## Figure 5b: whole-brain recall stability + legend
+
+```{r}
+# Get all unique ROIs
+rois <- unique(roi.rsa.data$ROI)
+
+# Initialize results dataframe
+ttest.results.stab <- data.frame(
+  ROI = character(),
+  t.value = numeric(),
+  df = numeric(),
+  p.value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each ROI and run t-test
+for (r in 1:length(rois)) {
+  
+  thisROI <- as.character(rois[r])
+  
+  # Calculate mean zDifference.stab per subject for this ROI
+  roiData <- roi.rsa.data %>%
+    filter(ROI == thisROI) %>%
+    group_by(subID) %>%
+    summarize(meanZDiff = mean(zDifference.stab, na.rm = TRUE))
+  
+  # Run t-test against zero
+  t.results <- t.test(roiData$meanZDiff, mu = 0)
+  
+  # Store results
+  ttest.results.stab <- rbind(
+    ttest.results.stab, 
+    data.frame(
+      ROI = thisROI,
+      t.value = t.results$statistic,
+      df = t.results$parameter,
+      p.value = t.results$p.value
+    )
+  )
+}
+
+# FDR correction
+ttest.results.stab$Pr.fdr <- p.adjust(ttest.results.stab$p.value, method = "fdr")
+ttest.results.stab <- ttest.results.stab %>%
+  mutate(sig = Pr.fdr < 0.05)
+
+# Display results summary
+cat("\nRecall-Recall Stability: Number of significant ROIs:", sum(ttest.results.stab$sig), "\n")
+print(ttest.results.stab %>% filter(sig == TRUE))
+
+# Save results CSV
+write.csv(
+  ttest.results.stab, 
+  file = file.path(output_dir, 'ttest_reactivation_recall_stability_vs_zero.csv'),
+  row.names = FALSE
+)
+
+# Create LEFT BRAIN ONLY plot (no legend)
+cat("Creating left brain plot for overall reactivation...\n")
+reactivation_left_brain <- create_left_brain_no_legend_stab(ttest.results.stab)
+
+# # Save the brain plot
+# ggsave(
+#   filename = file.path(output_dir, 't-test-stability_left_brain_only_FIG_5.png'),
+#   plot = reactivation_left_brain,
+#   device = "png",
+#   dpi = 300,
+#   width = 3,
+#   height = 1.92,
+#   units = "in",
+#   bg = "white"
+# )
+
+print(reactivation_left_brain)
+cat("Saved overall reactivation brain plot!\n")
+
+# Create and save SMALLER STANDALONE LEGEND 
+cat("Creating standalone legend (half size)...\n")
+legend_plot_small <- create_standalone_legend(minval = -4, maxval = 4)
+
+# ggsave(
+#   filename = file.path(output_dir, 'brain_legend_only_SMALL.png'),
+#   plot = legend_plot_small,
+#   device = "png",
+#   dpi = 300,
+#   width = 0.4,    # Half of 0.8
+#   height = 0.8,   # Half of original height
+#   units = "in",
+#   bg = "white"
+# )
+
+print(legend_plot_small)
+
+
+create_standalone_legend_small <- function(minval = -4, maxval = 4) {
+  
+  # Create a dummy dataset for the legend to add the correct min and max colors 
+  legend_data <- data.frame(
+    x = 1,
+    y = seq(minval, maxval, length.out = 100)
+  )
+  
+  legend_plot <- ggplot(legend_data, aes(x = x, y = y, fill = y)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#2166ac",
+      mid = "white",
+      high = "#b2182b",
+      midpoint = 0,
+      name = "t-value",
+      limits = c(minval, maxval),
+      breaks = c(minval, 0, maxval),  # Explicitly set breaks at min, 0, max
+      labels = c(as.character(minval), "0", as.character(maxval))
+    ) +
+    theme_void(base_size = 8) +  # Smaller base size
+    theme(
+      legend.position = "right",
+      legend.key.height = unit(1.2, "cm"),  # Slightly taller for readability
+      legend.key.width = unit(0.25, "cm"),
+      legend.title = element_text(size = 7, face = "bold"),
+      legend.text = element_text(size = 6),
+      plot.margin = margin(0, 0, 0, 0)
+    ) +
+    guides(fill = guide_colorbar(
+      title = "t-value",
+      title.position = "top",
+      title.hjust = 0.5,
+      barheight = unit(1.2, "cm"),
+      barwidth = unit(0.25, "cm")
+    ))
+  
+  return(legend_plot)
+}
+
+# Create and save the better small legend
+cat("Creating improved standalone legend (small)...\n")
+legend_plot_small <- create_standalone_legend_small(minval = -4, maxval = 4)
+
+# ggsave(
+#   filename = file.path(output_dir, 'brain_legend_only_SMALL_v2.png'),
+#   plot = legend_plot_small,
+#   device = "png",
+#   dpi = 300,
+#   width = 0.5,    # Slightly wider to accommodate labels
+#   height = 1,     # Height for the legend bar
+#   units = "in",
+#   bg = "white"
+# )
+
+print(legend_plot_small)
+```
+
+# RSA and success ratings
+
+## setup 
+```{r}
+rsadata %>%
+  filter(network %in% include_networks) %>%
+  group_by(subID, trial, network, conditionName, valenceCategory, cueWord.act) %>%
+  summarize(
+    zDifference = mean(zDifference, na.rm = TRUE),
+    zDifference.stab = mean(zDifference.stab, na.rm = TRUE),
+    regSuccess = first(as.numeric(regSuccess)),
+    eventDets = first(as.numeric(eventDets)),
+    visualDets = first(as.numeric(visualDets)),
+    .groups = "drop"
+  ) -> network.data.reviewer
+```
+
+```{r}
+rsa_success_data_noNA <- network.data.reviewer %>%
+  filter(!is.na(regSuccess))
+```
+
+## run both models 
+```{r}
+checkingrsa1 <- data.frame()
+include_networks = c("DefaultA","DefaultB","DefaultC")
+
+# define function
+success_valence_rsa <- function(curROI,model.stats) {
+  
+  # RECALL
+  roiData <- network.data.reviewer %>% filter(network %in% curROI)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model <- lmer(zDifference.stab ~ regSuccess*valenceCategory + (1|subID), data = roiData)
+ 
+  
+    stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats,ROI=curROI)
+  model.stats <- rbind(model.stats,stats)
+  
+  return(model.stats)
+}
+
+checkingrsa1 = success_valence_rsa("DefaultA", checkingrsa1)
+checkingrsa1 = success_valence_rsa("DefaultB", checkingrsa1)
+checkingrsa1 = success_valence_rsa("DefaultC", checkingrsa1)
+
+```
+
+
+
+```{r}
+checkingrsa.encret <- data.frame()
+include_networks = c("DefaultA","DefaultB","DefaultC")
+
+# define function
+success_valence_rsa <- function(curROI,model.stats) {
+  
+  # RECALL
+  roiData <- network.data.reviewer %>% filter(network %in% curROI)
+  roiData$valenceCategory <- factor(roiData$valenceCategory, levels=c("neu", "neg", "pos"))
+  full.model <- lmer(zDifference ~ regSuccess*valenceCategory + (1|subID), data = roiData)
+ 
+  
+    stats <- data.frame(summary(full.model)$coefficients[2:nrow(summary(full.model)$coefficients),])
+  stats <- mutate(stats,ROI=curROI)
+  model.stats <- rbind(model.stats,stats)
+  
+  return(model.stats)
+}
+
+checkingrsa.encret = success_valence_rsa("DefaultA", checkingrsa.encret)
+checkingrsa.encret = success_valence_rsa("DefaultB", checkingrsa.encret)
+checkingrsa.encret = success_valence_rsa("DefaultC", checkingrsa.encret)
+
+```
+
+
+## recall stability 
+
+```{r}
+# valenceCategoryneg main effect
+valence.neg.model = checkingrsa1 %>%
+    filter((row.names(checkingrsa1) == "valenceCategoryneg") |
+           (row.names(checkingrsa1) == "valenceCategoryneg1") |
+           (row.names(checkingrsa1) == "valenceCategoryneg2"))
+p.values <- valence.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+valence.neg.model <- cbind(valence.neg.model,Pr.fdr)
+valence.neg.model <- mutate(valence.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(valence.neg.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# valenceCategorypos main effect
+valence.pos.model = checkingrsa1 %>%
+    filter((row.names(checkingrsa1) == "valenceCategorypos") |
+           (row.names(checkingrsa1) == "valenceCategorypos1") |
+           (row.names(checkingrsa1) == "valenceCategorypos2"))
+p.values <- valence.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+valence.pos.model <- cbind(valence.pos.model,Pr.fdr)
+valence.pos.model <- mutate(valence.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(valence.pos.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# regSuccess:valenceCategoryneg interaction
+succ.neg.model = checkingrsa1 %>%
+    filter((row.names(checkingrsa1) == "regSuccess:valenceCategoryneg") |
+           (row.names(checkingrsa1) == "regSuccess:valenceCategoryneg1") |
+           (row.names(checkingrsa1) == "regSuccess:valenceCategoryneg2"))
+p.values <- succ.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+succ.neg.model <- cbind(succ.neg.model,Pr.fdr)
+succ.neg.model <- mutate(succ.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(succ.neg.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# regSuccess:valenceCategorypos interaction
+succ.pos.model = checkingrsa1 %>%
+    filter((row.names(checkingrsa1) == "regSuccess:valenceCategorypos") |
+           (row.names(checkingrsa1) == "regSuccess:valenceCategorypos1") |
+           (row.names(checkingrsa1) == "regSuccess:valenceCategorypos2"))
+p.values <- succ.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+succ.pos.model <- cbind(succ.pos.model,Pr.fdr)
+succ.pos.model <- mutate(succ.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(succ.pos.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+
+
+#regSuccess main effect
+success.model = checkingrsa1 %>%
+    filter((row.names(checkingrsa1) == "regSuccess") |
+           (row.names(checkingrsa1) == "regSuccess1") |
+           (row.names(checkingrsa1) == "regSuccess2"))
+p.values <- success.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+success.model <- cbind(success.model,Pr.fdr)
+success.model <- mutate(success.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(success.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+```
+
+
+## template-recall
+
+```{r}
+# valenceCategoryneg main effect
+valence.neg.model = checkingrsa.encret %>%
+    filter((row.names(checkingrsa.encret) == "valenceCategoryneg") |
+           (row.names(checkingrsa.encret) == "valenceCategoryneg1") |
+           (row.names(checkingrsa.encret) == "valenceCategoryneg2"))
+p.values <- valence.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+valence.neg.model <- cbind(valence.neg.model,Pr.fdr)
+valence.neg.model <- mutate(valence.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(valence.neg.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# valenceCategorypos main effect
+valence.pos.model = checkingrsa.encret %>%
+    filter((row.names(checkingrsa.encret) == "valenceCategorypos") |
+           (row.names(checkingrsa.encret) == "valenceCategorypos1") |
+           (row.names(checkingrsa.encret) == "valenceCategorypos2"))
+p.values <- valence.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+valence.pos.model <- cbind(valence.pos.model,Pr.fdr)
+valence.pos.model <- mutate(valence.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(valence.pos.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# regSuccess:valenceCategoryneg interaction
+succ.neg.model = checkingrsa.encret %>%
+    filter((row.names(checkingrsa.encret) == "regSuccess:valenceCategoryneg") |
+           (row.names(checkingrsa.encret) == "regSuccess:valenceCategoryneg1") |
+           (row.names(checkingrsa.encret) == "regSuccess:valenceCategoryneg2"))
+p.values <- succ.neg.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+succ.neg.model <- cbind(succ.neg.model,Pr.fdr)
+succ.neg.model <- mutate(succ.neg.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(succ.neg.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+# regSuccess:valenceCategorypos interaction
+succ.pos.model = checkingrsa.encret %>%
+    filter((row.names(checkingrsa.encret) == "regSuccess:valenceCategorypos") |
+           (row.names(checkingrsa.encret) == "regSuccess:valenceCategorypos1") |
+           (row.names(checkingrsa.encret) == "regSuccess:valenceCategorypos2"))
+p.values <- succ.pos.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+succ.pos.model <- cbind(succ.pos.model,Pr.fdr)
+succ.pos.model <- mutate(succ.pos.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(succ.pos.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+
+
+#regSuccess main effect
+success.model = checkingrsa.encret %>%
+    filter((row.names(checkingrsa.encret) == "regSuccess") |
+           (row.names(checkingrsa.encret) == "regSuccess1") |
+           (row.names(checkingrsa.encret) == "regSuccess2"))
+p.values <- success.model[,5]
+Pr.fdr <- p.adjust(p.values, method = "fdr")
+success.model <- cbind(success.model,Pr.fdr)
+success.model <- mutate(success.model,sig = ifelse(Pr.fdr<.05,TRUE,FALSE))
+kbl(success.model,digits=3) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width =FALSE) %>%
+  scroll_box(width="400",height="200px") 
+
+```
+
+## Extended Figure 1-1c (success and recall stability)
+
+```{r}
+
+# make sure valence order is consistent
+network.data.reviewer$valenceCategory <- factor(network.data.reviewer$valenceCategory,
+                                               levels = c("neu", "neg", "pos"))
+# define function to run model + extract predictions for one network
+get_preds <- function(cur_net) {
+  dat <- network.data.reviewer %>% filter(network == cur_net)
+  
+  if (nrow(dat) == 0) return(NULL)
+  
+  mod <- lmer(zDifference.stab ~ regSuccess * valenceCategory + (1|subID), data = dat)
+  preds <- ggpredict(mod, terms = c("regSuccess [all]", "valenceCategory"), type = "fixed")
+  preds$network <- cur_net
+  return(preds)
+}
+# run for all three subnetworks
+include_networks <- c("DefaultA", "DefaultB", "DefaultC")
+pred_activity_all <- map_dfr(include_networks, get_preds)
+# relabel for pretty facets
+pred_activity_all$network <- recode(pred_activity_all$network,
+                                    "DefaultA" = "Core midline",
+                                    "DefaultB" = "Dorsomedial",
+                                    "DefaultC" = "Medial temporal")
+# plot combined predictions
+activity_plot <- ggplot(pred_activity_all, 
+                        aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1.1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, color = NA) +
+  facet_wrap(~ network, nrow = 1) +
+  scale_color_manual(values = c("neu" = "#1f78b4",
+                                "neg" = "#e3401a",
+                                "pos" = "#33a02c"),
+                     labels = c("Neutral", "Negative", "Positive"),
+                     name = "Valence") +
+  scale_fill_manual(values = c("neu" = "#1f78b4",
+                               "neg" = "#e3401a",
+                               "pos" = "#33a02c"),
+                    labels = c("Neutral", "Negative", "Positive"),
+                    name = "Valence") +
+  labs(x = "Subjective success rating (mean centered)",
+       y = "Recall stability")+
+  theme_classic(base_size = 10) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.4, "cm"),
+    axis.line.x = element_line(color = "black", size = .5), 
+    axis.line.y = element_line(color = "black", size = .5), 
+    axis.title.y = element_text(size = 10),
+    axis.title.x = element_text(size = 10), 
+    axis.text.y = element_text(size = 8), 
+    axis.text.x = element_text(size = 8),
+    plot.title = element_blank(),
+    axis.ticks = element_line(color = "black", size = .5),
+    axis.ticks.length = unit(0.1, "cm")
+  )
+activity_plot
+
+# ggsave(filename = 'insert-path',
+#        plot = activity_plot,
+#        device = "png",
+#        dpi = 300,
+#        width = 5.5,
+#        height = 3.25,
+#        units = "in")
+```
+
+
+
+
+
