@@ -1587,5 +1587,87 @@ activity_plot
 
 
 
+## create accurate legneds for brain plots
 
+### create accurate legend
+```{r}
+# Replicates the limits logic in create_left_brain_no_legend(_stab) exactly
+get_brain_limits <- function(model_data) {
+  vals <- model_data %>%
+    filter(!ROI %in% c("LH_HIPP", "RH_HIPP", "LH_AMYG", "RH_AMYG")) %>%
+    pull(t.value)
 
+  minval <- min(vals, na.rm = TRUE)
+  maxval <- max(vals, na.rm = TRUE)
+
+  # same symmetrizing rules as the brain function
+  if (abs(minval) > abs(maxval) & minval < 0 & maxval > 0) maxval <- -1 * minval
+  if (abs(maxval) > abs(minval) & minval < 0 & maxval > 0) minval <- -1 * maxval
+
+  c(minval, maxval)
+}
+
+create_matched_legend <- function(model_data, title = expression(italic(t)*"-value")) {
+
+  lims <- get_brain_limits(model_data)
+  cat("Legend limits (match brain plot):", round(lims, 3), "\n")
+
+  # only label 0 if it's inside the range
+  brks <- if (lims[1] < 0 & lims[2] > 0) c(lims[1], 0, lims[2]) else lims
+  labs <- sprintf("%.2f", brks)
+  labs[brks == 0] <- "0"
+
+  legend_data <- data.frame(x = 1, y = seq(lims[1], lims[2], length.out = 100))
+
+  p <- ggplot(legend_data, aes(x = x, y = y, fill = y)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#2166ac", mid = "white", high = "#b2182b",
+      midpoint = 0,
+      limits = lims,
+      breaks = brks,
+      labels = labs,
+      name = title
+    ) +
+    guides(fill = guide_colorbar(
+      title.position = "top", title.hjust = 0.5,
+      barheight = unit(1.2, "cm"), barwidth = unit(0.25, "cm")
+    )) +
+    theme_void(base_size = 8) +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(size = 7, face = "bold"),
+      legend.text = element_text(size = 6)
+    )
+
+  # keep only the colorbar (drops the dummy gradient panel)
+  cowplot::ggdraw(cowplot::get_legend(p)) +
+    theme(plot.background = element_rect(fill = "white", color = NA))
+}
+```
+
+```{r}
+legend_plot <- create_matched_legend(ttest.results.stab)
+
+# ggsave(
+#   filename = file.path('output-dir/legend_stab_matched.png'),
+#   plot = legend_plot,
+#   device = "png", dpi = 300,
+#   width = 0.5, height = 1, units = "in", bg = "white"
+# )
+print(legend_plot)
+```
+
+for template-recall
+```{r}
+legend_plot_template <- create_matched_legend(ttest.results)
+
+# ggsave(
+#   filename = file.path('output-dir/legend_tempre_matched.png'),
+#   plot = legend_plot_template,
+#   device = "png", dpi = 300,
+#   width = 0.5, height = 1, units = "in", bg = "white"
+# )
+
+print(legend_plot_template)
+```
