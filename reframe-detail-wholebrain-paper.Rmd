@@ -591,7 +591,7 @@ library(dplyr)
 library(knitr)
 library(tidyr)
 
-df <- read.csv("/Users/ninacurko/Downloads/my_exported_table.csv")
+df <- read.csv("/Volumes/memolab/Data/Behavioral_Online/reframe-details/my_exported_table.csv")
 
 
 df_clean <- df %>%

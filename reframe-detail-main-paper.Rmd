@@ -387,13 +387,13 @@ subdata %>%
 
 p2
 
- ggsave(filename = '/Users/ninacurko/Desktop/may25-reframe-figs/network_valence.png',
-       plot = p2,
-       device = "png",
-       dpi = 300,
-       width = 4.2,
-       height = 2.7 ,
-       units = "in")
+ # ggsave(filename = 'insert-path/network_valence.png',
+ #       plot = p2,
+ #       device = "png",
+ #       dpi = 300,
+ #       width = 4.2,
+ #       height = 2.7 ,
+ #       units = "in")
 
 ```
 

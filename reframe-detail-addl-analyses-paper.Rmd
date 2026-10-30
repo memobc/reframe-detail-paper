@@ -11,7 +11,7 @@ library(dplyr)
 library(stringr)
 
 
-coded_dir <- "/Users/ninacurko/Downloads/coded"   
+coded_dir <- "/Volumes/memolab/Data/Behavioral_Online/reframe-details/coded"   
 all_files <- list.files(coded_dir, pattern = "\\.xlsx$", full.names = TRUE)
 ```
 
